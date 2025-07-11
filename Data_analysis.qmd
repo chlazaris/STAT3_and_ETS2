@@ -1,0 +1,2294 @@
+---
+title: "STAT3 acts as a suppressor of the transcription factor Ets-2 in activated T helper cells-Data Analysis"
+author: "Charalampos Lazaris"
+format: gfm
+editor: visual
+---
+
+## Purpose
+
+The purpose of this document is to provide a reproducible environment and generate all the graphs included in the manuscript "STAT3 acts as a suppressor of the transcription factor Ets-2 in activated T helper cells" by Theodoraki et al., along with the statistical analysis.
+
+## Analysis
+
+We load the required libraries/packages:
+
+```{r}
+library(ggpubr) # For plotting and statistical tests
+library(tidyverse) # For data wrangling and summarizing
+library(readxl)  # To read excel files
+library(cowplot) # To create composite figures
+library(gt) # For creating tables
+library(gtExtras) # For additional gt features
+```
+
+### Helper functions
+
+Function to calculate change in expression levels (mRNA) between groups based on qPCR data:
+
+```{r}
+compare_qpcr_groups <- function(df, group_col = "treatment", 
+                                gene_col = "stat3", actin_col = "actin", 
+                                control_group = "CM", 
+                                wilcox_pairs = list(c("CM", "PI"))) {
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+  }
+
+  # Remove the outliers
+  df <- remove_outliers(data = df, column = gene_col, group = group_col)
+  
+  # ΔCt calculation
+  df <- df %>%
+    mutate(DeltaCt = .data[[gene_col]] - .data[[actin_col]])
+  
+  # Mean ΔCt for control
+  mean_DeltaCt_control <- mean(df$DeltaCt[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # ΔΔCt and FoldChange
+  df <- df %>%
+    mutate(
+      mean_DeltaCt_control = mean_DeltaCt_control,
+      DeltaDeltaCt = DeltaCt - mean_DeltaCt_control,
+      FoldChange = 2^(-DeltaDeltaCt)
+    )
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+  
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor)
+
+  # Mann-Whitney tests (non-parametric test for comparing two independent samples)
+  wilcox_results <- map_dfr(
+    wilcox_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        group1 = group1,
+        group2 = group2,
+        p.value = test$p.value,
+        statistic = test$statistic
+      )
+    }
+  )
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+  
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+
+  
+  # Plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  scale_fill_manual(values = c("gray", "black")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = toupper(gene_col),
+    x = group_col,
+    y = "Relative Gene Expression\n(mRNA)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+We create a function to compare qPCR results only when ratios and actin measurements are available:
+
+```{r}
+compare_qpcr_groups_with_ratio <- function(df, group_col = "treatment", 
+                                gene_col = "stat3", actin_col = "actin", 
+                                ratio_col = "ratio",
+                                control_group = "CM", 
+                                wilcox_pairs = NULL) {
+  
+  # Calculate gene_col based on actin_col and ratio_col
+  df <- df %>%
+    mutate(!!rlang::sym(gene_col) := .data[[actin_col]] * .data[[ratio_col]])
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+   }
+
+  # Remove the outliers
+  df <- remove_outliers(data = df, column = gene_col, group = group_col)
+  
+  # Calculate the FoldChange based on the actin control
+  df <- df %>%
+    mutate(FoldChange = .data[[gene_col]] / .data[[actin_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests for specified pairs (only if wilcox_pairs is provided)
+  wilcox_results <- NULL
+  if (!is.null(wilcox_pairs)) {
+    wilcox_results <- map_dfr(
+      wilcox_pairs,
+      function(pair) {
+        group1 <- pair[1]
+        group2 <- pair[2]
+        vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+        vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+        test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+        tibble(
+          group1 = group1,
+          group2 = group2,
+          p.value = test$p.value,
+          statistic = test$statistic
+        )
+      }
+    )
+  }
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  scale_fill_manual(values = c("gray", "black")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = toupper(gene_col),
+    x = group_col,
+    y = "Relative Gene Expression\n(mRNA)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+We create another function to calculate changes in gene expression levels based only on the ratio:
+
+```{r}
+compare_protein_ratio <- function(df, 
+                               ratio_col = "ratio",
+                               group_col = "treatment", 
+                               gene_name = "STAT3",
+                               control_group = "CM", 
+                               wilcox_pairs = list(c("CM", "PI"))) {
+  
+  # FoldChange is essentially the ratio
+  df <- df %>%
+    mutate(FoldChange = .data[[ratio_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  # Normalized fold change is calculated by the ratio multiplied by the norm_factor
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = .data[[ratio_col]] * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests (non-parametric test for comparing two independent samples)
+  wilcox_results <- map_dfr(
+    wilcox_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        group1 = group1,
+        group2 = group2,
+        p.value = test$p.value,
+        statistic = test$statistic
+      )
+    }
+  )
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+
+  # Convert condition to a factor() - assuming condition column exists
+  if("condition" %in% names(df)) {
+    df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  }
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot with gene name as title
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange)) +
+  {if("condition" %in% names(df)) 
+    aes(color = condition, fill = condition)
+  } +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  {if("condition" %in% names(df)) 
+    scale_fill_manual(values = c("gray", "black"))
+  } +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = toupper(gene_name),
+    x = group_col,
+    y = "Relative Gene Expression\n(Protein)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+We modify the function to work for PCR with only ratio column:
+
+```{r}
+compare_qpcr_ratio <- function(df, 
+                               ratio_col = "ratio",
+                               group_col = "treatment", 
+                               gene_name = "IL2",
+                               control_group = "CM", 
+                               wilcox_pairs = NULL) {
+  
+  # FoldChange is essentially the ratio
+  df <- df %>%
+    mutate(FoldChange = .data[[ratio_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  # Normalized fold change is calculated by the ratio multiplied by the norm_factor
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = .data[[ratio_col]] * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests for specified pairs (only if wilcox_pairs is provided)
+  wilcox_results <- NULL
+  if (!is.null(wilcox_pairs)) {
+    wilcox_results <- map_dfr(
+      wilcox_pairs,
+      function(pair) {
+        group1 <- pair[1]
+        group2 <- pair[2]
+        vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+        vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+        test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+        tibble(
+          group1 = group1,
+          group2 = group2,
+          p.value = test$p.value,
+          statistic = test$statistic
+        )
+      }
+    )
+  }
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+  
+  # Convert condition to a factor() - assuming condition column exists
+  if("condition" %in% names(df)) {
+    df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  }
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot with gene name as title
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange)) +
+  {if("condition" %in% names(df)) 
+    aes(color = condition, fill = condition)
+  } +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  {if("condition" %in% names(df)) 
+    scale_fill_manual(values = c("gray", "black"))
+  } +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = toupper(gene_name),
+    x = group_col,
+    y = "Relative Gene Expression\n(mRNA)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+We create a function to calculate changes in protein levels between groups based on Western blot data:
+
+```{r}
+compare_protein_groups <- function(df, group_col = "treatment", 
+                                gene_col = "stat3", actin_col = "actin", 
+                                control_group = "CM", 
+                                wilcox_pairs = list(c("CM", "PI"))) {
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+   }
+
+  # Remove the outliers
+  df <- remove_outliers(data = df, column = gene_col, group = group_col)
+  
+  # Calculate the FoldChange based on the actin control
+  df <- df %>%
+    mutate(FoldChange = .data[[gene_col]] / .data[[actin_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests (non-parametric test for comparing two independent samples)
+  wilcox_results <- map_dfr(
+    wilcox_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        group1 = group1,
+        group2 = group2,
+        p.value = test$p.value,
+        statistic = test$statistic
+      )
+    }
+  )
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  scale_fill_manual(values = c("gray", "black")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = toupper(gene_col),
+    x = group_col,
+    y = "Relative Gene Expression\n(protein)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+We modify the first one of the helper functions, to compare ChIP-seq data:
+
+```{r}
+compare_chipseq_groups <- function(df, group_col = "treatment", 
+                                gene_col = "stat3", control_col = "control", 
+                                control_group = "CM", 
+                                wilcox_pairs = NULL) {
+  
+  # Populate the control column with the sum of the gene_col and dct
+  df <- df %>%
+    mutate(!!rlang::sym(control_col) := .data[[gene_col]] - .data[["dct"]])
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+  }
+
+  # Remove the outliers
+  df <- remove_outliers(data = df, column = gene_col, group = group_col)
+  
+  # ΔCt calculation
+  df <- df %>%
+    mutate(DeltaCt = .data[[gene_col]] - .data[[control_col]])
+  
+  # Mean ΔCt for control
+  mean_DeltaCt_control <- mean(df$DeltaCt[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # ΔΔCt and FoldChange
+  df <- df %>%
+    mutate(
+      mean_DeltaCt_control = mean_DeltaCt_control,
+      DeltaDeltaCt = DeltaCt - mean_DeltaCt_control,
+      FoldChange = 2^(-DeltaDeltaCt)
+    )
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+  
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor)
+
+  # Mann-Whitney tests for specified pairs (only if wilcox_pairs is provided)
+  wilcox_results <- NULL
+  if (!is.null(wilcox_pairs)) {
+    wilcox_results <- map_dfr(
+      wilcox_pairs,
+      function(pair) {
+        group1 <- pair[1]
+        group2 <- pair[2]
+        vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+        vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+        test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+        tibble(
+          group1 = group1,
+          group2 = group2,
+          p.value = test$p.value,
+          statistic = test$statistic
+        )
+      }
+    )
+  }
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() %>%
+    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
+    fmt_number(columns = c(P_value), decimals = 4) %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = Significant == "Yes")
+    )
+  
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col as a factor with all levels present in the data
+  # in the desired order
+  
+  # Create custom factor levels with desired order
+  create_custom_order <- function(levels) {
+    cm_base <- levels[levels == "CM"]
+    pi_base <- levels[levels == "PI"]
+    cm_stat <- levels[grepl("^CM_STAT", levels)]
+    pi_stat <- levels[grepl("^PI_STAT", levels)]
+  
+    cm_stat <- sort(cm_stat)
+    pi_stat <- sort(pi_stat)
+  
+    return(c(cm_base, pi_base, cm_stat, pi_stat))
+  }
+
+  #  Apply custom ordering to the group_col
+  group_levels <- unique(as.character(df[[group_col]]))
+  custom_levels <- create_custom_order(group_levels)
+  
+  # Set the group_col as a factor with the custom levels
+  df[[group_col]] <- factor(df[[group_col]], levels = custom_levels)
+
+  # Create base plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+    stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+    stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+    geom_jitter(width = 0.15, color = "black", size = 1) +
+    scale_fill_manual(values = c("gray", "black")) +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(
+      title = toupper(gene_col),
+      x = group_col,
+      y = "Fold Enrichment (ChIP-seq)"
+    ) +
+    ylim(0, 10)
+  
+  # Add statistical comparisons only if wilcox_pairs is provided
+  if (!is.null(wilcox_pairs)) {
+    p <- p + stat_compare_means(
+      comparisons = wilcox_pairs,
+      method = "wilcox.test",
+      hide.ns = TRUE,
+      label = "p.signif",
+      size = 3
+    )
+  }
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+### Figure 2
+
+#### Figure 2a (ETS2 mRNA expression levels)
+
+We import the data for ETS2 mRNA expression levels from the qPCR experiment:
+
+```{r}
+fig2_ets2_qpcr_data <- read_xlsx("input/Figure2_data.xlsx", sheet = "ETS2_mRNA")
+```
+
+```{r}
+fig2_ets2_qpcr_result <- compare_qpcr_groups(
+  fig2_ets2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+fig2_ets2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+#| warning: false
+fig2a <- fig2_ets2_qpcr_result$p
+```
+
+```{r}
+fig2a 
+```
+
+We export the figure to a PDF file in the Figure2 directory:
+
+```{r}
+ggsave("output/Figure2/fig2a_ets2_qpcr.pdf", fig2a, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 2b (STAT3 mRNA expression levels)
+
+We run the function for the STAT3 data:
+
+```{r}
+fig2_stat3_qpcr_data <- read_xlsx("input/Figure2_data.xlsx", sheet = "STAT3_mRNA")
+```
+
+```{r}
+fig2_stat3_qpcr_result <- compare_qpcr_groups(
+  fig2_stat3_qpcr_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+fig2_stat3_qpcr_result$all_wilcox_table
+```
+
+```{r}
+fig2b <- fig2_stat3_qpcr_result$p
+```
+
+```{r}
+fig2b
+```
+
+We export the figure to a PDF file in the Figure2 directory:
+
+```{r}
+ggsave("output/Figure2/fig2b_stat3_qpcr.pdf", fig2b, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 2c (IL2 mRNA expression levels)
+
+We calculate the relative expression levels for IL2 between the two conditions, based on qPCR data:
+
+```{r}
+fig2_il2_qpcr_data <- read_xlsx("input/Figure2_data.xlsx", sheet = "IL2_mRNA")
+```
+
+```{r}
+fig2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
+  fig2_il2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "il2",
+  actin_col = "actin",
+  ratio_col = "ratio",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+fig2_il2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+fig2c <- fig2_il2_qpcr_result$p
+```
+
+```{r}
+fig2c
+```
+
+We export the figure to a PDF file in the Figure2 directory:
+
+```{r}
+ggsave("output/Figure2/fig2c_il2_qpcr.pdf", fig2c, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 2d (ETS2 protein expression levels)
+
+We calculate the relative expression levels for ETS2 and STAT3 proteins between the two conditions, based on Western blot data:
+
+```{r}
+fig2_ets2_protein_data <- read_xlsx("input/Figure2_data.xlsx", sheet = "ETS2_protein_new")
+```
+
+```{r}
+fig2_ets2_protein_result <- compare_protein_groups(
+  fig2_ets2_protein_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+fig2_ets2_protein_result$all_wilcox_table
+```
+
+```{r}
+fig2d <- fig2_ets2_protein_result$p
+```
+
+```{r}
+fig2d 
+```
+
+We export the figure to a PDF file in the Figure2 directory:
+
+```{r}
+ggsave("output/Figure2/fig2d_ets2_protein.pdf", fig2d, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 2e (STAT3 protein expression levels)
+
+We do the same for STAT3:
+
+```{r}
+fig2_stat3_protein_data <- read_xlsx("input/Figure2_data.xlsx", sheet = "STAT3_protein")
+```
+
+```{r}
+fig2_stat3_protein_result <- compare_protein_groups(
+  fig2_stat3_protein_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+fig2_stat3_protein_result$all_wilcox_table
+```
+
+```{r}
+fig2e <- fig2_stat3_protein_result$p
+```
+
+```{r}
+fig2e
+```
+
+We export the figure to a PDF file in the Figure2 directory:
+
+```{r}
+ggsave("output/Figure2/fig2e_stat3_protein.pdf", fig2e, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+We create the composite figure for Figure 2, which includes all the individual panels. For convenience, we repeat one panel to replace by the Western blot:
+
+```{r}
+composite_fig2 <- plot_grid(fig2a, fig2d, fig2b, fig2e, fig2c, fig2c,
+                            ncol = 2, nrow = 3, 
+                            labels = c("A", "D", "B", "E", "C", "F"), 
+                            label_size = 12, 
+                            align = "v") 
+```
+
+```{r}
+#| warning: false
+composite_fig2
+```
+
+```{r}
+ggsave("output/Figure2/composite_fig2.pdf", composite_fig2, 
+       width = 6, height = 9, dpi = 300)
+```
+
+### Figure 3
+
+#### Figure 3a (ETS2 mRNA expression levels)
+
+We import the expression data (qPCR) for ETS2:
+
+```{r}
+fig3_ets2_qpcr_data <- read_xlsx("input/Figure3_data.xlsx", sheet = "ETS2_mRNA")
+```
+
+```{r}
+#| warning: false
+fig3_ets2_qpcr_result <- compare_qpcr_groups(
+  fig3_ets2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"), c("CM", "CM_500"), c("CM", "CM_1000"), c("PI", "PI_500"), 
+                      c("PI", "PI_1000"), c("PI", "PI_1500"))
+)
+```
+
+```{r}
+fig3_ets2_qpcr_result$wilcox_results
+```
+
+```{r}
+fig3_ets2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+fig3a <- fig3_ets2_qpcr_result$p
+```
+
+```{r}
+fig3a
+```
+
+We export the figure to a PDF file in the Figure3 directory:
+
+```{r}
+ggsave("output/Figure3/fig3a_ets2_qpcr.pdf", fig3a, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 3b (ETS2 protein expression levels)
+
+We do the same using the new ETS2 protein data:
+
+```{r}
+fig3_ets2_protein_data_new <- read_xlsx("input/Figure3_data.xlsx", sheet = "ETS2_protein_new")
+```
+
+```{r}
+fig3_ets2_protein_result_new <- compare_protein_groups(
+  fig3_ets2_protein_data_new,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "CM_500"), c("CM", "CM_1000"), c("CM", "CM_1500"),
+                      c("PI", "PI_250"), c("PI", "PI_500"), 
+                      c("PI", "PI_1000"))
+)
+```
+
+```{r}
+fig3_ets2_protein_result_new$all_wilcox_table
+```
+
+```{r}
+fig3b_new <- fig3_ets2_protein_result_new$p
+```
+
+```{r}
+fig3b_new
+```
+
+We export the figure to a PDF file in the Figure3 directory:
+
+```{r}
+ggsave("output/Figure3/fig3b_ets2_protein.pdf", fig3b_new, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 3d (STAT3 protein expression levels)
+
+We get the relative expression levels for STAT3 (protein):
+
+```{r}
+fig3_stat3_protein_data <- read_xlsx("input/Figure3_data.xlsx", sheet = "STAT3_protein")
+```
+
+```{r}
+fig3_stat3_protein_result <- compare_protein_groups(
+  fig3_stat3_protein_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("PI", "PI_250"), c("PI", "PI_500"), 
+                      c("PI", "PI_1000"), c("PI", "PI_1500"))
+)
+```
+
+```{r}
+fig3_stat3_protein_result$all_wilcox_table
+```
+
+```{r}
+fig3d <- fig3_stat3_protein_result$p
+```
+
+```{r}
+fig3d
+```
+
+We export the figure to a PDF file in the Figure3 directory:
+
+```{r}
+ggsave("output/Figure3/fig3d_stat3_protein.pdf", fig3d, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 3f (IL2 mRNA expression levels)
+
+We do the same for IL2 expression levels (mRNA):
+
+```{r}
+fig3_il2_qpcr_data <- read_xlsx("input/Figure3_data.xlsx", sheet = "IL2_mRNA")
+```
+
+```{r}
+fig3_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
+  fig3_il2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "il2",
+  actin_col = "actin",
+  ratio_col = "ratio",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("PI", "PI_1500"))
+)
+```
+
+```{r}
+fig3_il2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+fig3f <- fig3_il2_qpcr_result$p
+```
+
+```{r}
+fig3f
+```
+
+We export the figure to a PDF file in the Figure3 directory:
+
+```{r}
+ggsave("output/Figure3/fig3f_il2_qpcr.pdf", fig3f, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+We create the composite Figure 3 and add two panels (fig3f copies) as placeholders for Western blots:
+
+```{r}
+composite_fig3 <- plot_grid(fig3a, fig3d, fig3b_new, fig3f, fig3f, fig3f,
+                            ncol = 2, nrow = 3, 
+                            labels = c("A", "D", "B", "E", "C", "F"), 
+                            label_size = 12, 
+                            align = "v")
+```
+
+```{r}
+composite_fig3
+```
+
+We save the composite Figure 3 to a file:
+
+```{r}
+ggsave("output/Figure3/composite_fig3.pdf", composite_fig3, 
+       width = 8, height = 9, dpi = 300)
+```
+
+### Figure 4
+
+#### Figure 4a (STAT3 mRNA expression levels)
+
+We import the expression data (qPCR) for STAT3:
+
+```{r}
+fig4_stat3_qpcr_data <- read_xlsx("input/Figure4_data.xlsx", sheet = "STAT3_mRNA")
+```
+
+```{r}
+#| warning: false
+fig4_stat3_qpcr_result <- compare_qpcr_groups(
+  fig4_stat3_qpcr_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("PI", "PI SI STAT3"))
+)
+```
+
+```{r}
+fig4_stat3_qpcr_result$wilcox_results
+```
+
+```{r}
+fig4a <- fig4_stat3_qpcr_result$p
+```
+
+```{r}
+fig4a
+```
+
+We save the figure to a PDF file in the Figure4 directory:
+
+```{r}
+ggsave("output/Figure4/fig4a_stat3_qpcr.pdf", fig4a, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 4b (ETS2 mRNA expression levels)
+
+We do the same for ETS2:
+
+```{r}
+fig4_ets2_qpcr_data <- read_xlsx("input/Figure4_data.xlsx", sheet = "ETS2_mRNA_20250709")
+```
+
+```{r}
+#| warning: false
+fig4_ets2_qpcr_result <- compare_qpcr_groups(
+  fig4_ets2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"), c("PI", "PI SI STAT3"))
+)
+```
+
+```{r}
+fig4_ets2_qpcr_result$wilcox_results
+```
+
+```{r}
+fig4_ets2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+fig4b <- fig4_ets2_qpcr_result$p
+```
+
+```{r}
+fig4b
+```
+
+We save the figure to a PDF file in the Figure4 directory:
+
+```{r}
+ggsave("output/Figure4/fig4b_ets2_qpcr.pdf", fig4b, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 4c (IL2 expression levels)
+
+We do the same for IL2 expression levels:
+
+```{r}
+fig4_il2_qpcr_data <- read_xlsx("input/Figure4_data.xlsx", sheet = "IL2_mRNA")
+```
+
+```{r}
+#| warning: false
+fig4_il2_qpcr_result <- compare_qpcr_ratio(
+  fig4_il2_qpcr_data,
+  group_col = "treatment",
+  gene_name = "il2",
+  ratio_col = "ratio",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"), c("PI", "PI SI STAT3"))
+)
+```
+
+```{r}
+fig4_il2_qpcr_result$wilcox_results
+```
+
+```{r}
+fig4_il2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+#| warning: false
+fig4c <- fig4_il2_qpcr_result$p
+```
+
+```{r}
+#| warning: false
+fig4c
+```
+
+We save the figure to a PDF file in the Figure4 directory:
+
+```{r}
+ggsave("output/Figure4/fig4c_il2_qpcr.pdf", fig4c, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 4d (STAT3 protein expression levels)
+
+We do the same for STAT3 protein levels:
+
+```{r}
+fig4_stat3_protein_data <- read_xlsx("input/Figure4_data.xlsx", sheet = "STAT3_protein_20250701")
+```
+
+```{r}
+fig4_stat3_protein_result <- compare_protein_ratio(
+  fig4_stat3_protein_data,
+  group_col = "treatment",
+  gene_name = "stat3",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"), c("PI", "PI SI STAT3"),
+                      c("CM", "CM SI STAT3"))
+)
+```
+
+```{r}
+fig4_stat3_protein_result$wilcox_results
+```
+
+```{r}
+fig4_stat3_protein_result$all_wilcox_table
+```
+
+```{r}
+fig4d <- fig4_stat3_protein_result$p
+```
+
+```{r}
+fig4d
+```
+
+We save the figure to a PDF file in the Figure4 directory:
+
+```{r}
+ggsave("output/Figure4/fig4d_stat3_protein.pdf", fig4d, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Figure 4e (ETS2 protein expression levels)
+
+We do the same for ETS2 protein levels:
+
+```{r}
+fig4_ets2_protein_data <- read_xlsx("input/Figure4_data.xlsx", sheet = "ETS2_protein_20250701")
+```
+
+```{r}
+fig4_ets2_protein_result <- compare_protein_ratio(
+  fig4_ets2_protein_data,
+  group_col = "treatment",
+  gene_name = "ets2",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"), c("PI", "PI SI STAT3"),
+                      c("CM", "CM SI STAT3"))
+)
+```
+
+```{r}
+fig4_ets2_protein_result$wilcox_results
+```
+
+```{r}
+fig4_ets2_protein_result$all_wilcox_table
+```
+
+```{r}
+fig4e <- fig4_ets2_protein_result$p
+```
+
+```{r}
+fig4e
+```
+
+We create the composite Figure 4:
+
+```{r}
+#| warning: false
+composite_fig4 <- plot_grid(fig4a, fig4d, fig4b, fig4e, fig4c, fig4c,
+                            ncol = 2, nrow = 3, 
+                            labels = c("A", "D", "B", "E", "C", "F"), 
+                            label_size = 12, 
+                            align = "v")
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 12
+composite_fig4
+```
+
+```{r}
+ggsave("output/Figure4/composite_fig4.pdf", composite_fig4, 
+       width = 7, height = 12, dpi = 300)
+```
+
+### Figure 5
+
+#### IL6 promoter STAT3
+
+We import the data for IL6_promoter_control_STAT3:
+
+```{r}
+fig5_il6_promoter_stat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "IL6_prom_control_STAT3_20250709")
+```
+
+We compare the STAT3 binding to the IL6 promoter between the two conditions:
+
+```{r}
+fig5_il6_promoter_stat3_result <- compare_chipseq_groups(
+  fig5_il6_promoter_stat3_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  control_col = "control",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM_STAT3", "PI_STAT3"), c("PI", "PI_STAT3"))
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_il6_promoter_stat3_result$wilcox_results
+```
+
+We check the results of all the statistical tests:
+
+```{r}
+fig5_il6_promoter_stat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5g <- fig5_il6_promoter_stat3_result$p
+```
+
+```{r}
+fig5g
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5g_il6_promoter_stat3.pdf", fig5g, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### IL6 promoter-STAT3P
+
+We import the data for IL6_promoter_control_pSTAT3:
+
+```{r}
+fig5_il6_promoter_pstat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "IL6_promoter_control_STAT3P")
+```
+
+```{r}
+fig5_il6_promoter_pstat3_result <- compare_chipseq_groups(
+  fig5_il6_promoter_pstat3_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  control_col = "control",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM_STAT3P", "PI_STAT3P"), 
+                      c("PI", "PI_STAT3P")) 
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_il6_promoter_pstat3_result$wilcox_results
+```
+
+```{r}
+fig5_il6_promoter_pstat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5h <- fig5_il6_promoter_pstat3_result$p
+```
+
+```{r}
+fig5h
+```
+
+We save the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5h_il6_promoter_pstat3.pdf", fig5h, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Actin promoter control STAT3
+
+We import the data for actin_promoter_control_STAT3:
+
+```{r}
+fig5_actin_promoter_stat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "actin_promoter_control_STAT3")
+```
+
+We compare the STAT3 binding:
+
+```{r}
+fig5_actin_promoter_stat3_result <- compare_chipseq_groups(
+  fig5_actin_promoter_stat3_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_actin_promoter_stat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5i <- fig5_actin_promoter_stat3_result$p
+```
+
+```{r}
+fig5i
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5i_actin_promoter_stat3.pdf", fig5i, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Actin promoter control STAT3P
+
+We import the data for actin_promoter_control_pSTAT3:
+
+```{r}
+fig5_actin_promoter_pstat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "actin_promoter_control_STAT3P")
+```
+
+```{r}
+fig5_actin_promoter_pstat3_result <- compare_chipseq_groups(
+  fig5_actin_promoter_pstat3_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_actin_promoter_pstat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5j <- fig5_actin_promoter_pstat3_result$p
+```
+
+```{r}
+fig5j
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5j_actin_promoter_pstat3.pdf", fig5j, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS1 STAT3
+
+We import the data for GAS1_STAT3:
+
+```{r}
+fig5_gas1_stat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS1_STAT3")
+```
+
+```{r}
+fig5_gas1_stat3_result <- compare_chipseq_groups(
+  fig5_gas1_stat3_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas1_stat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5a <- fig5_gas1_stat3_result$p
+```
+
+```{r}
+fig5a
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5a_gas1_stat3.pdf", fig5a, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS1 STAT3P
+
+We import the data for GAS1_STAT3P:
+
+```{r}
+fig5_gas1_stat3p_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS1_STAT3P")
+```
+
+```{r}
+fig5_gas1_stat3p_result <- compare_chipseq_groups(
+  fig5_gas1_stat3p_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas1_stat3p_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5b <- fig5_gas1_stat3p_result$p
+```
+
+```{r}
+fig5b
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5b_gas1_stat3p.pdf", fig5b, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS2/GAS3 STAT3
+
+We import the data for GAS2_GAS3_STAT3:
+
+```{r}
+fig5_gas2_gas3_stat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS2_GAS3_STAT3")
+```
+
+```{r}
+fig5_gas2_gas3_stat3_result <- compare_chipseq_groups(
+  fig5_gas2_gas3_stat3_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas2_gas3_stat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5c <- fig5_gas2_gas3_stat3_result$p
+```
+
+```{r}
+fig5c
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5c_gas2_gas3_stat3.pdf", fig5c, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS2/GAS3 STAT3P
+
+We import the data for GAS2_GAS3_STAT3P:
+
+```{r}
+fig5_gas2_gas3_stat3p_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS2_GAS3_STAT3P")
+```
+
+```{r}
+fig5_gas2_gas3_stat3p_result <- compare_chipseq_groups(
+  fig5_gas2_gas3_stat3p_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas2_gas3_stat3p_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5d <- fig5_gas2_gas3_stat3p_result$p
+```
+
+```{r}
+fig5d
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5d_gas2_gas3_stat3p.pdf", fig5d, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS4 STAT3
+
+We import the data for GAS4_STAT3:
+
+```{r}
+fig5_gas4_stat3_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS4_STAT3")
+```
+
+```{r}
+fig5_gas4_stat3_result <- compare_chipseq_groups(
+  fig5_gas4_stat3_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  control_col = "control",
+  control_group = "CM"
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas4_stat3_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5e <- fig5_gas4_stat3_result$p
+```
+
+```{r}
+fig5e
+```
+
+We export the figure to a PDF file in the Figure5 directory:
+
+```{r}
+ggsave("output/Figure5/fig5e_gas4_stat3.pdf", fig5e, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### GAS4 STAT3P
+
+We import the data for GAS4_STAT3P:
+
+```{r}
+fig5_gas4_stat3p_data <- read_xlsx("input/Figure5_data.xlsx", sheet = "GAS4_STAT3P")
+```
+
+```{r}
+fig5_gas4_stat3p_result <- compare_chipseq_groups(
+  fig5_gas4_stat3p_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  control_col = "control",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM_STAT3P", "PI_STAT3P"), 
+                      c("PI", "PI_STAT3P"))
+)
+```
+
+We check the results of the statistical tests:
+
+```{r}
+fig5_gas4_stat3p_result$all_wilcox_table
+```
+
+We get the graph:
+
+```{r}
+fig5f <- fig5_gas4_stat3p_result$p
+```
+
+```{r}
+fig5f
+```
+
+We use the `plot_grid` function to create the composite Figure 5. The figure will have 2 rows and 5 columns, with the first row containing the STAT3 data and the second row containing the STAT3P data:
+
+```{r}
+composite_fig5 <- plot_grid(fig5a, fig5c, fig5e, fig5g, fig5i,
+                            fig5b, fig5d, fig5f, fig5h, fig5j,
+                            ncol = 5, nrow = 2,
+                            labels = c("A", "C", "E", "G", "I",
+                                       "B", "D", "F", "H", "J"),
+                            label_size = 12,
+                            align = "v")
+```
+
+```{r}
+#| warning: false
+#| fig.width: 15
+#| fig.height: 7
+composite_fig5
+```
+
+We save the composite Figure 5 to a file:
+
+```{r}
+ggsave("output/Figure5/composite_fig5.pdf", composite_fig5, 
+       width = 15, height = 7, dpi = 300, useDingbats=FALSE)
+```
+
+## Supplemental Data
+
+### Supplemental Figure 1
+
+#### Supplemental Figure 1a (STAT5B mRNA expression levels)
+
+We import the data for STAT5B mRNA expression levels from the qPCR experiment:
+
+```{r}
+suppl1_stat5b_qpcr_data <- read_xlsx("input/Supplemental_Figure1_data.xlsx", sheet = "STAT5_mRNA")
+```
+
+We compare the STAT5B mRNA expression levels between the two conditions:
+
+```{r}
+suppl1_stat5b_qpcr_result <- compare_qpcr_groups(
+  suppl1_stat5b_qpcr_data,
+  group_col = "treatment",
+  gene_col = "stat5b",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+We check all the statistical test results:
+
+```{r}
+suppl1_stat5b_qpcr_result$all_wilcox_table
+```
+
+We plot the results:
+
+```{r}
+suppl_fig1a <- suppl1_stat5b_qpcr_result$p
+```
+
+```{r}
+suppl_fig1a
+```
+
+We save the figure to a PDF file in the Supplemental Figure 1 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure1/suppl_fig1a_stat5b_qpcr.pdf", suppl_fig1a, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Supplemental Figure 1b (STAT5B protein expression levels)
+
+We do the same for STAT5B protein levels:
+
+```{r}
+suppl1_stat5b_protein_data <- read_xlsx("input/Supplemental_Figure1_data.xlsx", sheet = "STAT5_protein")
+```
+
+```{r}
+suppl1_stat5b_protein_result <- compare_protein_groups(
+  suppl1_stat5b_protein_data,
+  group_col = "treatment",
+  gene_col = "stat5b",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+suppl1_stat5b_protein_result$all_wilcox_table
+```
+
+We plot the results:
+
+```{r}
+suppl_fig1b <- suppl1_stat5b_protein_result$p
+```
+
+```{r}
+suppl_fig1b
+```
+
+We save the figure to a PDF file in the Supplemental Figure 1 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure1/suppl_fig1b_stat5b_protein.pdf", suppl_fig1b, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+We create the composite Supplemental Figure 1 using fig1b as placeholder for the Western blots:
+
+```{r}
+composite_suppl1 <- plot_grid(suppl_fig1a, suppl_fig1b, suppl_fig1b,
+                              ncol = 1, nrow = 3, 
+                              labels = c("A", "B", "C"), 
+                              label_size = 12, 
+                              align = "v")
+```
+
+```{r}
+composite_suppl1
+```
+
+We save the composite Supplemental Figure 1:
+
+```{r}
+ggsave("output/Supplemental_Figure1/composite_suppl_fig1.pdf", composite_suppl1, 
+       width = 4, height = 12, dpi = 300)
+```
+
+### Supplemental Figure 2
+
+#### Supplemental Figure 2a (ETS2 mRNA expression levels)
+
+```{r}
+suppl2_ets2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "ETS2_mRNA")
+```
+
+```{r}
+#| warning: false
+suppl2_ets2_qpcr_result <- compare_qpcr_groups(
+  suppl2_ets2_qpcr_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("PI", "PI_250"),
+                      c("PI", "PI_1000"), c("PI", "PI_1500"))
+)
+```
+
+```{r}
+suppl2_ets2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig2a <- suppl2_ets2_qpcr_result$p
+```
+
+```{r}
+suppl_fig2a
+```
+
+We save the figure to a PDF file in the Supplemental Figure 2 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure2/suppl_fig2a_ets2_qpcr.pdf", suppl_fig2a, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Supplemental Figure 2b (ETS2 protein expression levels)
+
+We do the same for ETS2 (protein) levels:
+
+```{r}
+suppl2_ets2_protein_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "ETS2_protein_new_data")
+```
+
+```{r}
+#| warning: false
+suppl2_ets2_protein_result <- compare_protein_groups(suppl2_ets2_protein_data,
+  group_col = "treatment",
+  gene_col = "ets2",
+  control_group = "CM",
+  wilcox_pairs = list(c("PI", "PI_1500"),
+                      c("CM", "CM_250"))
+)
+```
+
+```{r}
+suppl2_ets2_protein_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig2b <- suppl2_ets2_protein_result$p
+```
+
+```{r}
+suppl_fig2b
+```
+
+We save the figure to a PDF file in the Supplemental Figure 2 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure2/suppl_fig2b_ets2_protein.pdf", suppl_fig2b, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Supplemental Figure 2d (STAT5B protein levels)
+
+We repeat the same for STAT5B protein levels:
+
+```{r}
+suppl2_stat5b_protein_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "STAT5B_protein_new_data")
+```
+
+```{r}
+#| warning: false
+suppl2_stat5b_protein_result <- compare_protein_groups(suppl2_stat5b_protein_data,
+  group_col = "treatment",
+  gene_col = "stat5b",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("CM", "CM_500"), c("CM", "CM_1000"), c("CM", "CM_1500"),
+                      c("PI", "PI_1000"), c("PI", "PI_1500"))
+)
+```
+
+```{r}
+suppl2_stat5b_protein_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig2d <- suppl2_stat5b_protein_result$p
+```
+
+```{r}
+suppl_fig2d
+```
+
+We save the figure to a PDF file in the Supplemental Figure 2 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure2/suppl_fig2d_stat5b_protein.pdf", suppl_fig2d, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Supplemental Figure 2f (IL2 mRNA expression levels)
+
+We do the same for IL2 mRNA expression levels (qPCR):
+
+```{r}
+suppl2_il2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "IL2_mRNA_new_data")
+```
+
+```{r}
+#| warning: false
+suppl2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
+  suppl2_il2_qpcr_data,
+  group_col = "treatment",
+  actin_col = "actin",
+  gene_col = "il2",
+  ratio_col = "ratio",
+  control_group = "CM"
+)
+```
+
+```{r}
+suppl2_il2_qpcr_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig2f <- suppl2_il2_qpcr_result$p
+```
+
+```{r}
+suppl_fig2f
+```
+
+We save the figure to a PDF file in the Supplemental Figure 2 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure2/suppl_fig2f_il2_qpcr.pdf", suppl_fig2f, 
+       width = 6, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+We create the composite Supplemental Figure 2:
+
+```{r}
+composite_suppl2 <- plot_grid(suppl_fig2a, suppl_fig2b, suppl_fig2d, suppl_fig2f, 
+                              ncol = 2, nrow = 2, 
+                              labels = c("A", "B", "D", "F"), 
+                              label_size = 12, 
+                              align = "v")
+```
+
+We save the composite Supplemental Figure 2:
+
+```{r}
+ggsave("output/Supplemental_Figure2/composite_suppl_fig2.pdf", composite_suppl2, 
+       width = 8, height = 10, dpi = 300)
+```
+
+### Supplemental Figure 3
+
+#### Supplemental Figure 3a (STAT3 protein levels)
+
+We import the data for STAT3 protein levels from the Western blot experiment:
+
+```{r}
+suppl3_stat3_protein_data <- read_xlsx("input/Supplemental_Figure3_data.xlsx", sheet = "STAT3_protein")
+```
+
+We compare the STAT3 protein levels between the two conditions:
+
+```{r}
+suppl3_stat3_protein_result <- compare_protein_groups(
+  suppl3_stat3_protein_data,
+  group_col = "treatment",
+  gene_col = "stat3",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+suppl3_stat3_protein_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig3a <- suppl3_stat3_protein_result$p
+```
+
+```{r}
+suppl_fig3a
+```
+
+We save the figure to a PDF file in the Supplemental Figure 3 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure3/suppl_fig3a_stat3_protein.pdf", suppl_fig3a, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+#### Supplemental Figure 3b (phosphorylated STAT3 protein levels)
+
+We do the same for the levels of phosphorylated STAT3 (pSTAT3):
+
+```{r}
+suppl3_phospho_stat3_protein_data <- read_xlsx("input/Supplemental_Figure3_data.xlsx", sheet = "STAT3p_protein")
+```
+
+```{r}
+suppl3_phospho_stat3_protein_result <- compare_protein_groups(
+  suppl3_phospho_stat3_protein_data,
+  group_col = "treatment",
+  gene_col = "stat3p",
+  actin_col = "actin",
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"))
+)
+```
+
+```{r}
+suppl3_phospho_stat3_protein_result$all_wilcox_table
+```
+
+```{r}
+suppl_fig3b <- suppl3_phospho_stat3_protein_result$p
+```
+
+```{r}
+suppl_fig3b
+```
+
+We save the figure to a PDF file in the Supplemental Figure 3 directory:
+
+```{r}
+ggsave("output/Supplemental_Figure3/suppl_fig3b_phospho_stat3_protein.pdf", suppl_fig3b, 
+       width = 3, height = 6, dpi = 300, useDingbats=FALSE)
+```
+
+We create the composite Supplemental Figure 3 and create a placeholder for the Western blot in the third panel:
+
+```{r}
+composite_suppl3 <- plot_grid(suppl_fig3a, suppl_fig3b, suppl_fig3b,
+                              ncol = 1, nrow = 3, 
+                              labels = c("A", "B", "C"), 
+                              label_size = 12, 
+                              align = "v")
+```
+
+```{r}
+composite_suppl3
+```
+
+We save the composite Supplemental Figure 3:
+
+```{r}
+ggsave("output/Supplemental_Figure3/composite_suppl_fig3.pdf", composite_suppl3, 
+       width = 6, height = 10, dpi = 300)
+```
+
+## Computational environment
+
+The computational environment including the R version and all the packages used for this analysis is provided below:
+
+```{r}
+sessionInfo()
+```
