@@ -149,13 +149,7 @@ compare_qpcr_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt()
   
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -287,13 +281,7 @@ compare_qpcr_groups_with_ratio <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt()
 
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -327,8 +315,131 @@ compare_qpcr_groups_with_ratio <- function(df, group_col = "treatment",
 }
 ```
 
+``` r
+compare_qpcr_groups_with_only_ratio <- function(df, group_col = "treatment", 
+                                ratio_col = "ratio",
+                                control_group = "CM", 
+                                wilcox_pairs = NULL) {
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+   }
+
+  # Remove the outliers from ratio column
+  df <- remove_outliers(data = df, column = ratio_col, group = group_col)
+  
+  # Calculate the FoldChange based on the ratio column
+  df <- df %>%
+    mutate(FoldChange = .data[[ratio_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests for specified pairs (only if wilcox_pairs is provided)
+  wilcox_results <- NULL
+  if (!is.null(wilcox_pairs)) {
+    wilcox_results <- map_dfr(
+      wilcox_pairs,
+      function(pair) {
+        group1 <- pair[1]
+        group2 <- pair[2]
+        vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+        vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+        test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+        tibble(
+          group1 = group1,
+          group2 = group2,
+          p.value = test$p.value,
+          statistic = test$statistic
+        )
+      }
+    )
+  }
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() 
+
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  scale_fill_manual(values = c("gray", "black")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "IL2",
+    x = group_col,
+    y = "Relative Gene Expression\n(mRNA)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
 We create another function to calculate changes in gene expression
-levels based only on the ratio:
+levels (protein) based only on the ratio:
 
 ``` r
 compare_protein_ratio <- function(df, 
@@ -400,13 +511,7 @@ compare_protein_ratio <- function(df,
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
 
   # Convert condition to a factor() - assuming condition column exists
   if("condition" %in% names(df)) {
@@ -522,13 +627,7 @@ compare_qpcr_ratio <- function(df,
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
   
   # Convert condition to a factor() - assuming condition column exists
   if("condition" %in% names(df)) {
@@ -658,13 +757,7 @@ compare_protein_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
 
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -796,13 +889,7 @@ compare_chipseq_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
   
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -887,23 +974,23 @@ fig2_ets2_qpcr_result <- compare_qpcr_groups(
 fig2_ets2_qpcr_result$all_wilcox_table
 ```
 
-<div id="yotfxaavff" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#yotfxaavff table {
+<div id="wnlcbsesfb" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#wnlcbsesfb table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#yotfxaavff thead, #yotfxaavff tbody, #yotfxaavff tfoot, #yotfxaavff tr, #yotfxaavff td, #yotfxaavff th {
+#wnlcbsesfb thead, #wnlcbsesfb tbody, #wnlcbsesfb tfoot, #wnlcbsesfb tr, #wnlcbsesfb td, #wnlcbsesfb th {
   border-style: none;
 }
 
-#yotfxaavff p {
+#wnlcbsesfb p {
   margin: 0;
   padding: 0;
 }
 
-#yotfxaavff .gt_table {
+#wnlcbsesfb .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -929,12 +1016,12 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_caption {
+#wnlcbsesfb .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#yotfxaavff .gt_title {
+#wnlcbsesfb .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -946,7 +1033,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#yotfxaavff .gt_subtitle {
+#wnlcbsesfb .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -958,7 +1045,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#yotfxaavff .gt_heading {
+#wnlcbsesfb .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -970,13 +1057,13 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_bottom_border {
+#wnlcbsesfb .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_col_headings {
+#wnlcbsesfb .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -991,7 +1078,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_col_heading {
+#wnlcbsesfb .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1011,7 +1098,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#yotfxaavff .gt_column_spanner_outer {
+#wnlcbsesfb .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1023,15 +1110,15 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#yotfxaavff .gt_column_spanner_outer:first-child {
+#wnlcbsesfb .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#yotfxaavff .gt_column_spanner_outer:last-child {
+#wnlcbsesfb .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#yotfxaavff .gt_column_spanner {
+#wnlcbsesfb .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -1043,11 +1130,11 @@ fig2_ets2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#yotfxaavff .gt_spanner_row {
+#wnlcbsesfb .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#yotfxaavff .gt_group_heading {
+#wnlcbsesfb .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1073,7 +1160,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#yotfxaavff .gt_empty_group_heading {
+#wnlcbsesfb .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -1088,15 +1175,15 @@ fig2_ets2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#yotfxaavff .gt_from_md > :first-child {
+#wnlcbsesfb .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#yotfxaavff .gt_from_md > :last-child {
+#wnlcbsesfb .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#yotfxaavff .gt_row {
+#wnlcbsesfb .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1115,7 +1202,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#yotfxaavff .gt_stub {
+#wnlcbsesfb .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1128,7 +1215,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#yotfxaavff .gt_stub_row_group {
+#wnlcbsesfb .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1142,15 +1229,15 @@ fig2_ets2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#yotfxaavff .gt_row_group_first td {
+#wnlcbsesfb .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#yotfxaavff .gt_row_group_first th {
+#wnlcbsesfb .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#yotfxaavff .gt_summary_row {
+#wnlcbsesfb .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -1160,16 +1247,16 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#yotfxaavff .gt_first_summary_row {
+#wnlcbsesfb .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_first_summary_row.thick {
+#wnlcbsesfb .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#yotfxaavff .gt_last_summary_row {
+#wnlcbsesfb .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1179,7 +1266,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_grand_summary_row {
+#wnlcbsesfb .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -1189,7 +1276,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#yotfxaavff .gt_first_grand_summary_row {
+#wnlcbsesfb .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1199,7 +1286,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_last_grand_summary_row_top {
+#wnlcbsesfb .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1209,11 +1296,11 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_striped {
+#wnlcbsesfb .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#yotfxaavff .gt_table_body {
+#wnlcbsesfb .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -1222,7 +1309,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_footnotes {
+#wnlcbsesfb .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -1236,7 +1323,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_footnote {
+#wnlcbsesfb .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -1245,7 +1332,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#yotfxaavff .gt_sourcenotes {
+#wnlcbsesfb .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -1259,7 +1346,7 @@ fig2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#yotfxaavff .gt_sourcenote {
+#wnlcbsesfb .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -1267,63 +1354,63 @@ fig2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#yotfxaavff .gt_left {
+#wnlcbsesfb .gt_left {
   text-align: left;
 }
 
-#yotfxaavff .gt_center {
+#wnlcbsesfb .gt_center {
   text-align: center;
 }
 
-#yotfxaavff .gt_right {
+#wnlcbsesfb .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#yotfxaavff .gt_font_normal {
+#wnlcbsesfb .gt_font_normal {
   font-weight: normal;
 }
 
-#yotfxaavff .gt_font_bold {
+#wnlcbsesfb .gt_font_bold {
   font-weight: bold;
 }
 
-#yotfxaavff .gt_font_italic {
+#wnlcbsesfb .gt_font_italic {
   font-style: italic;
 }
 
-#yotfxaavff .gt_super {
+#wnlcbsesfb .gt_super {
   font-size: 65%;
 }
 
-#yotfxaavff .gt_footnote_marks {
+#wnlcbsesfb .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#yotfxaavff .gt_asterisk {
+#wnlcbsesfb .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#yotfxaavff .gt_indent_1 {
+#wnlcbsesfb .gt_indent_1 {
   text-indent: 5px;
 }
 
-#yotfxaavff .gt_indent_2 {
+#wnlcbsesfb .gt_indent_2 {
   text-indent: 10px;
 }
 
-#yotfxaavff .gt_indent_3 {
+#wnlcbsesfb .gt_indent_3 {
   text-indent: 15px;
 }
 
-#yotfxaavff .gt_indent_4 {
+#wnlcbsesfb .gt_indent_4 {
   text-indent: 20px;
 }
 
-#yotfxaavff .gt_indent_5 {
+#wnlcbsesfb .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -1337,10 +1424,10 @@ fig2_ets2_qpcr_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">44</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0496</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">44</td>
+<td headers="P_value" class="gt_row gt_right">0.04955045</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -1355,7 +1442,7 @@ fig2a <- fig2_ets2_qpcr_result$p
 fig2a 
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-12-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-13-1.png)
 
 We export the figure to a PDF file in the Figure2 directory:
 
@@ -1387,23 +1474,23 @@ fig2_stat3_qpcr_result <- compare_qpcr_groups(
 fig2_stat3_qpcr_result$all_wilcox_table
 ```
 
-<div id="nwtbhwaswt" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#nwtbhwaswt table {
+<div id="goqgsbxooe" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#goqgsbxooe table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#nwtbhwaswt thead, #nwtbhwaswt tbody, #nwtbhwaswt tfoot, #nwtbhwaswt tr, #nwtbhwaswt td, #nwtbhwaswt th {
+#goqgsbxooe thead, #goqgsbxooe tbody, #goqgsbxooe tfoot, #goqgsbxooe tr, #goqgsbxooe td, #goqgsbxooe th {
   border-style: none;
 }
 
-#nwtbhwaswt p {
+#goqgsbxooe p {
   margin: 0;
   padding: 0;
 }
 
-#nwtbhwaswt .gt_table {
+#goqgsbxooe .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -1429,12 +1516,12 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_caption {
+#goqgsbxooe .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#nwtbhwaswt .gt_title {
+#goqgsbxooe .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -1446,7 +1533,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#nwtbhwaswt .gt_subtitle {
+#goqgsbxooe .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -1458,7 +1545,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#nwtbhwaswt .gt_heading {
+#goqgsbxooe .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -1470,13 +1557,13 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_bottom_border {
+#goqgsbxooe .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_col_headings {
+#goqgsbxooe .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -1491,7 +1578,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_col_heading {
+#goqgsbxooe .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1511,7 +1598,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#nwtbhwaswt .gt_column_spanner_outer {
+#goqgsbxooe .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1523,15 +1610,15 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#nwtbhwaswt .gt_column_spanner_outer:first-child {
+#goqgsbxooe .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#nwtbhwaswt .gt_column_spanner_outer:last-child {
+#goqgsbxooe .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#nwtbhwaswt .gt_column_spanner {
+#goqgsbxooe .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -1543,11 +1630,11 @@ fig2_stat3_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#nwtbhwaswt .gt_spanner_row {
+#goqgsbxooe .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#nwtbhwaswt .gt_group_heading {
+#goqgsbxooe .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1573,7 +1660,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#nwtbhwaswt .gt_empty_group_heading {
+#goqgsbxooe .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -1588,15 +1675,15 @@ fig2_stat3_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#nwtbhwaswt .gt_from_md > :first-child {
+#goqgsbxooe .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#nwtbhwaswt .gt_from_md > :last-child {
+#goqgsbxooe .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#nwtbhwaswt .gt_row {
+#goqgsbxooe .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1615,7 +1702,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#nwtbhwaswt .gt_stub {
+#goqgsbxooe .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1628,7 +1715,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#nwtbhwaswt .gt_stub_row_group {
+#goqgsbxooe .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -1642,15 +1729,15 @@ fig2_stat3_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#nwtbhwaswt .gt_row_group_first td {
+#goqgsbxooe .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#nwtbhwaswt .gt_row_group_first th {
+#goqgsbxooe .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#nwtbhwaswt .gt_summary_row {
+#goqgsbxooe .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -1660,16 +1747,16 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#nwtbhwaswt .gt_first_summary_row {
+#goqgsbxooe .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_first_summary_row.thick {
+#goqgsbxooe .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#nwtbhwaswt .gt_last_summary_row {
+#goqgsbxooe .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1679,7 +1766,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_grand_summary_row {
+#goqgsbxooe .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -1689,7 +1776,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#nwtbhwaswt .gt_first_grand_summary_row {
+#goqgsbxooe .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1699,7 +1786,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_last_grand_summary_row_top {
+#goqgsbxooe .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -1709,11 +1796,11 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_striped {
+#goqgsbxooe .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#nwtbhwaswt .gt_table_body {
+#goqgsbxooe .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -1722,7 +1809,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_footnotes {
+#goqgsbxooe .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -1736,7 +1823,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_footnote {
+#goqgsbxooe .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -1745,7 +1832,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#nwtbhwaswt .gt_sourcenotes {
+#goqgsbxooe .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -1759,7 +1846,7 @@ fig2_stat3_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#nwtbhwaswt .gt_sourcenote {
+#goqgsbxooe .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -1767,63 +1854,63 @@ fig2_stat3_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#nwtbhwaswt .gt_left {
+#goqgsbxooe .gt_left {
   text-align: left;
 }
 
-#nwtbhwaswt .gt_center {
+#goqgsbxooe .gt_center {
   text-align: center;
 }
 
-#nwtbhwaswt .gt_right {
+#goqgsbxooe .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#nwtbhwaswt .gt_font_normal {
+#goqgsbxooe .gt_font_normal {
   font-weight: normal;
 }
 
-#nwtbhwaswt .gt_font_bold {
+#goqgsbxooe .gt_font_bold {
   font-weight: bold;
 }
 
-#nwtbhwaswt .gt_font_italic {
+#goqgsbxooe .gt_font_italic {
   font-style: italic;
 }
 
-#nwtbhwaswt .gt_super {
+#goqgsbxooe .gt_super {
   font-size: 65%;
 }
 
-#nwtbhwaswt .gt_footnote_marks {
+#goqgsbxooe .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#nwtbhwaswt .gt_asterisk {
+#goqgsbxooe .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#nwtbhwaswt .gt_indent_1 {
+#goqgsbxooe .gt_indent_1 {
   text-indent: 5px;
 }
 
-#nwtbhwaswt .gt_indent_2 {
+#goqgsbxooe .gt_indent_2 {
   text-indent: 10px;
 }
 
-#nwtbhwaswt .gt_indent_3 {
+#goqgsbxooe .gt_indent_3 {
   text-indent: 15px;
 }
 
-#nwtbhwaswt .gt_indent_4 {
+#goqgsbxooe .gt_indent_4 {
   text-indent: 20px;
 }
 
-#nwtbhwaswt .gt_indent_5 {
+#goqgsbxooe .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -1837,10 +1924,10 @@ fig2_stat3_qpcr_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">5</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0411</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">5</td>
+<td headers="P_value" class="gt_row gt_right">0.04112554</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -1855,7 +1942,7 @@ fig2b <- fig2_stat3_qpcr_result$p
 fig2b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-18-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-19-1.png)
 
 We export the figure to a PDF file in the Figure2 directory:
 
@@ -1889,23 +1976,23 @@ fig2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
 fig2_il2_qpcr_result$all_wilcox_table
 ```
 
-<div id="vmykhunjul" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#vmykhunjul table {
+<div id="iwkvhqethl" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#iwkvhqethl table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#vmykhunjul thead, #vmykhunjul tbody, #vmykhunjul tfoot, #vmykhunjul tr, #vmykhunjul td, #vmykhunjul th {
+#iwkvhqethl thead, #iwkvhqethl tbody, #iwkvhqethl tfoot, #iwkvhqethl tr, #iwkvhqethl td, #iwkvhqethl th {
   border-style: none;
 }
 
-#vmykhunjul p {
+#iwkvhqethl p {
   margin: 0;
   padding: 0;
 }
 
-#vmykhunjul .gt_table {
+#iwkvhqethl .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -1931,12 +2018,12 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_caption {
+#iwkvhqethl .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#vmykhunjul .gt_title {
+#iwkvhqethl .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -1948,7 +2035,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#vmykhunjul .gt_subtitle {
+#iwkvhqethl .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -1960,7 +2047,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#vmykhunjul .gt_heading {
+#iwkvhqethl .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -1972,13 +2059,13 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_bottom_border {
+#iwkvhqethl .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_col_headings {
+#iwkvhqethl .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -1993,7 +2080,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_col_heading {
+#iwkvhqethl .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2013,7 +2100,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vmykhunjul .gt_column_spanner_outer {
+#iwkvhqethl .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2025,15 +2112,15 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#vmykhunjul .gt_column_spanner_outer:first-child {
+#iwkvhqethl .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#vmykhunjul .gt_column_spanner_outer:last-child {
+#iwkvhqethl .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#vmykhunjul .gt_column_spanner {
+#iwkvhqethl .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -2045,11 +2132,11 @@ fig2_il2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#vmykhunjul .gt_spanner_row {
+#iwkvhqethl .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#vmykhunjul .gt_group_heading {
+#iwkvhqethl .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2075,7 +2162,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#vmykhunjul .gt_empty_group_heading {
+#iwkvhqethl .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -2090,15 +2177,15 @@ fig2_il2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#vmykhunjul .gt_from_md > :first-child {
+#iwkvhqethl .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#vmykhunjul .gt_from_md > :last-child {
+#iwkvhqethl .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#vmykhunjul .gt_row {
+#iwkvhqethl .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2117,7 +2204,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vmykhunjul .gt_stub {
+#iwkvhqethl .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2130,7 +2217,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vmykhunjul .gt_stub_row_group {
+#iwkvhqethl .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2144,15 +2231,15 @@ fig2_il2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#vmykhunjul .gt_row_group_first td {
+#iwkvhqethl .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#vmykhunjul .gt_row_group_first th {
+#iwkvhqethl .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#vmykhunjul .gt_summary_row {
+#iwkvhqethl .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -2162,16 +2249,16 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vmykhunjul .gt_first_summary_row {
+#iwkvhqethl .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_first_summary_row.thick {
+#iwkvhqethl .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#vmykhunjul .gt_last_summary_row {
+#iwkvhqethl .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2181,7 +2268,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_grand_summary_row {
+#iwkvhqethl .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -2191,7 +2278,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vmykhunjul .gt_first_grand_summary_row {
+#iwkvhqethl .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2201,7 +2288,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_last_grand_summary_row_top {
+#iwkvhqethl .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2211,11 +2298,11 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_striped {
+#iwkvhqethl .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#vmykhunjul .gt_table_body {
+#iwkvhqethl .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -2224,7 +2311,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_footnotes {
+#iwkvhqethl .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -2238,7 +2325,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_footnote {
+#iwkvhqethl .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -2247,7 +2334,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vmykhunjul .gt_sourcenotes {
+#iwkvhqethl .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -2261,7 +2348,7 @@ fig2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vmykhunjul .gt_sourcenote {
+#iwkvhqethl .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -2269,63 +2356,63 @@ fig2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vmykhunjul .gt_left {
+#iwkvhqethl .gt_left {
   text-align: left;
 }
 
-#vmykhunjul .gt_center {
+#iwkvhqethl .gt_center {
   text-align: center;
 }
 
-#vmykhunjul .gt_right {
+#iwkvhqethl .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#vmykhunjul .gt_font_normal {
+#iwkvhqethl .gt_font_normal {
   font-weight: normal;
 }
 
-#vmykhunjul .gt_font_bold {
+#iwkvhqethl .gt_font_bold {
   font-weight: bold;
 }
 
-#vmykhunjul .gt_font_italic {
+#iwkvhqethl .gt_font_italic {
   font-style: italic;
 }
 
-#vmykhunjul .gt_super {
+#iwkvhqethl .gt_super {
   font-size: 65%;
 }
 
-#vmykhunjul .gt_footnote_marks {
+#iwkvhqethl .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#vmykhunjul .gt_asterisk {
+#iwkvhqethl .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#vmykhunjul .gt_indent_1 {
+#iwkvhqethl .gt_indent_1 {
   text-indent: 5px;
 }
 
-#vmykhunjul .gt_indent_2 {
+#iwkvhqethl .gt_indent_2 {
   text-indent: 10px;
 }
 
-#vmykhunjul .gt_indent_3 {
+#iwkvhqethl .gt_indent_3 {
   text-indent: 15px;
 }
 
-#vmykhunjul .gt_indent_4 {
+#iwkvhqethl .gt_indent_4 {
   text-indent: 20px;
 }
 
-#vmykhunjul .gt_indent_5 {
+#iwkvhqethl .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -2339,10 +2426,10 @@ fig2_il2_qpcr_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0079</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.007936508</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -2357,7 +2444,7 @@ fig2c <- fig2_il2_qpcr_result$p
 fig2c
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-24-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-25-1.png)
 
 We export the figure to a PDF file in the Figure2 directory:
 
@@ -2390,23 +2477,23 @@ fig2_ets2_protein_result <- compare_protein_groups(
 fig2_ets2_protein_result$all_wilcox_table
 ```
 
-<div id="gaotmzrlmi" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#gaotmzrlmi table {
+<div id="ksrdpojxcg" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#ksrdpojxcg table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#gaotmzrlmi thead, #gaotmzrlmi tbody, #gaotmzrlmi tfoot, #gaotmzrlmi tr, #gaotmzrlmi td, #gaotmzrlmi th {
+#ksrdpojxcg thead, #ksrdpojxcg tbody, #ksrdpojxcg tfoot, #ksrdpojxcg tr, #ksrdpojxcg td, #ksrdpojxcg th {
   border-style: none;
 }
 
-#gaotmzrlmi p {
+#ksrdpojxcg p {
   margin: 0;
   padding: 0;
 }
 
-#gaotmzrlmi .gt_table {
+#ksrdpojxcg .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -2432,12 +2519,12 @@ fig2_ets2_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_caption {
+#ksrdpojxcg .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#gaotmzrlmi .gt_title {
+#ksrdpojxcg .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -2449,7 +2536,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#gaotmzrlmi .gt_subtitle {
+#ksrdpojxcg .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -2461,7 +2548,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#gaotmzrlmi .gt_heading {
+#ksrdpojxcg .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -2473,13 +2560,13 @@ fig2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_bottom_border {
+#ksrdpojxcg .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_col_headings {
+#ksrdpojxcg .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -2494,7 +2581,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_col_heading {
+#ksrdpojxcg .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2514,7 +2601,7 @@ fig2_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#gaotmzrlmi .gt_column_spanner_outer {
+#ksrdpojxcg .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2526,15 +2613,15 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#gaotmzrlmi .gt_column_spanner_outer:first-child {
+#ksrdpojxcg .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#gaotmzrlmi .gt_column_spanner_outer:last-child {
+#ksrdpojxcg .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#gaotmzrlmi .gt_column_spanner {
+#ksrdpojxcg .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -2546,11 +2633,11 @@ fig2_ets2_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#gaotmzrlmi .gt_spanner_row {
+#ksrdpojxcg .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#gaotmzrlmi .gt_group_heading {
+#ksrdpojxcg .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2576,7 +2663,7 @@ fig2_ets2_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#gaotmzrlmi .gt_empty_group_heading {
+#ksrdpojxcg .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -2591,15 +2678,15 @@ fig2_ets2_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#gaotmzrlmi .gt_from_md > :first-child {
+#ksrdpojxcg .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#gaotmzrlmi .gt_from_md > :last-child {
+#ksrdpojxcg .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#gaotmzrlmi .gt_row {
+#ksrdpojxcg .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2618,7 +2705,7 @@ fig2_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#gaotmzrlmi .gt_stub {
+#ksrdpojxcg .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2631,7 +2718,7 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#gaotmzrlmi .gt_stub_row_group {
+#ksrdpojxcg .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -2645,15 +2732,15 @@ fig2_ets2_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#gaotmzrlmi .gt_row_group_first td {
+#ksrdpojxcg .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#gaotmzrlmi .gt_row_group_first th {
+#ksrdpojxcg .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#gaotmzrlmi .gt_summary_row {
+#ksrdpojxcg .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -2663,16 +2750,16 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#gaotmzrlmi .gt_first_summary_row {
+#ksrdpojxcg .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_first_summary_row.thick {
+#ksrdpojxcg .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#gaotmzrlmi .gt_last_summary_row {
+#ksrdpojxcg .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2682,7 +2769,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_grand_summary_row {
+#ksrdpojxcg .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -2692,7 +2779,7 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#gaotmzrlmi .gt_first_grand_summary_row {
+#ksrdpojxcg .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2702,7 +2789,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_last_grand_summary_row_top {
+#ksrdpojxcg .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -2712,11 +2799,11 @@ fig2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_striped {
+#ksrdpojxcg .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#gaotmzrlmi .gt_table_body {
+#ksrdpojxcg .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -2725,7 +2812,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_footnotes {
+#ksrdpojxcg .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -2739,7 +2826,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_footnote {
+#ksrdpojxcg .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -2748,7 +2835,7 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#gaotmzrlmi .gt_sourcenotes {
+#ksrdpojxcg .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -2762,7 +2849,7 @@ fig2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#gaotmzrlmi .gt_sourcenote {
+#ksrdpojxcg .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -2770,63 +2857,63 @@ fig2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#gaotmzrlmi .gt_left {
+#ksrdpojxcg .gt_left {
   text-align: left;
 }
 
-#gaotmzrlmi .gt_center {
+#ksrdpojxcg .gt_center {
   text-align: center;
 }
 
-#gaotmzrlmi .gt_right {
+#ksrdpojxcg .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#gaotmzrlmi .gt_font_normal {
+#ksrdpojxcg .gt_font_normal {
   font-weight: normal;
 }
 
-#gaotmzrlmi .gt_font_bold {
+#ksrdpojxcg .gt_font_bold {
   font-weight: bold;
 }
 
-#gaotmzrlmi .gt_font_italic {
+#ksrdpojxcg .gt_font_italic {
   font-style: italic;
 }
 
-#gaotmzrlmi .gt_super {
+#ksrdpojxcg .gt_super {
   font-size: 65%;
 }
 
-#gaotmzrlmi .gt_footnote_marks {
+#ksrdpojxcg .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#gaotmzrlmi .gt_asterisk {
+#ksrdpojxcg .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#gaotmzrlmi .gt_indent_1 {
+#ksrdpojxcg .gt_indent_1 {
   text-indent: 5px;
 }
 
-#gaotmzrlmi .gt_indent_2 {
+#ksrdpojxcg .gt_indent_2 {
   text-indent: 10px;
 }
 
-#gaotmzrlmi .gt_indent_3 {
+#ksrdpojxcg .gt_indent_3 {
   text-indent: 15px;
 }
 
-#gaotmzrlmi .gt_indent_4 {
+#ksrdpojxcg .gt_indent_4 {
   text-indent: 20px;
 }
 
-#gaotmzrlmi .gt_indent_5 {
+#ksrdpojxcg .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -2840,10 +2927,10 @@ fig2_ets2_protein_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -2858,7 +2945,7 @@ fig2d <- fig2_ets2_protein_result$p
 fig2d 
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-30-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-31-1.png)
 
 We export the figure to a PDF file in the Figure2 directory:
 
@@ -2890,23 +2977,23 @@ fig2_stat3_protein_result <- compare_protein_groups(
 fig2_stat3_protein_result$all_wilcox_table
 ```
 
-<div id="cvdhooqdmw" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#cvdhooqdmw table {
+<div id="eklxmlkmul" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#eklxmlkmul table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#cvdhooqdmw thead, #cvdhooqdmw tbody, #cvdhooqdmw tfoot, #cvdhooqdmw tr, #cvdhooqdmw td, #cvdhooqdmw th {
+#eklxmlkmul thead, #eklxmlkmul tbody, #eklxmlkmul tfoot, #eklxmlkmul tr, #eklxmlkmul td, #eklxmlkmul th {
   border-style: none;
 }
 
-#cvdhooqdmw p {
+#eklxmlkmul p {
   margin: 0;
   padding: 0;
 }
 
-#cvdhooqdmw .gt_table {
+#eklxmlkmul .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -2932,12 +3019,12 @@ fig2_stat3_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_caption {
+#eklxmlkmul .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#cvdhooqdmw .gt_title {
+#eklxmlkmul .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -2949,7 +3036,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#cvdhooqdmw .gt_subtitle {
+#eklxmlkmul .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -2961,7 +3048,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#cvdhooqdmw .gt_heading {
+#eklxmlkmul .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -2973,13 +3060,13 @@ fig2_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_bottom_border {
+#eklxmlkmul .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_col_headings {
+#eklxmlkmul .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -2994,7 +3081,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_col_heading {
+#eklxmlkmul .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3014,7 +3101,7 @@ fig2_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#cvdhooqdmw .gt_column_spanner_outer {
+#eklxmlkmul .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3026,15 +3113,15 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#cvdhooqdmw .gt_column_spanner_outer:first-child {
+#eklxmlkmul .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#cvdhooqdmw .gt_column_spanner_outer:last-child {
+#eklxmlkmul .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#cvdhooqdmw .gt_column_spanner {
+#eklxmlkmul .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -3046,11 +3133,11 @@ fig2_stat3_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#cvdhooqdmw .gt_spanner_row {
+#eklxmlkmul .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#cvdhooqdmw .gt_group_heading {
+#eklxmlkmul .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3076,7 +3163,7 @@ fig2_stat3_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#cvdhooqdmw .gt_empty_group_heading {
+#eklxmlkmul .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -3091,15 +3178,15 @@ fig2_stat3_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#cvdhooqdmw .gt_from_md > :first-child {
+#eklxmlkmul .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#cvdhooqdmw .gt_from_md > :last-child {
+#eklxmlkmul .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#cvdhooqdmw .gt_row {
+#eklxmlkmul .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3118,7 +3205,7 @@ fig2_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#cvdhooqdmw .gt_stub {
+#eklxmlkmul .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3131,7 +3218,7 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#cvdhooqdmw .gt_stub_row_group {
+#eklxmlkmul .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3145,15 +3232,15 @@ fig2_stat3_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#cvdhooqdmw .gt_row_group_first td {
+#eklxmlkmul .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#cvdhooqdmw .gt_row_group_first th {
+#eklxmlkmul .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#cvdhooqdmw .gt_summary_row {
+#eklxmlkmul .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -3163,16 +3250,16 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#cvdhooqdmw .gt_first_summary_row {
+#eklxmlkmul .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_first_summary_row.thick {
+#eklxmlkmul .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#cvdhooqdmw .gt_last_summary_row {
+#eklxmlkmul .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3182,7 +3269,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_grand_summary_row {
+#eklxmlkmul .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -3192,7 +3279,7 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#cvdhooqdmw .gt_first_grand_summary_row {
+#eklxmlkmul .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3202,7 +3289,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_last_grand_summary_row_top {
+#eklxmlkmul .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3212,11 +3299,11 @@ fig2_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_striped {
+#eklxmlkmul .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#cvdhooqdmw .gt_table_body {
+#eklxmlkmul .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -3225,7 +3312,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_footnotes {
+#eklxmlkmul .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -3239,7 +3326,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_footnote {
+#eklxmlkmul .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -3248,7 +3335,7 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#cvdhooqdmw .gt_sourcenotes {
+#eklxmlkmul .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -3262,7 +3349,7 @@ fig2_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#cvdhooqdmw .gt_sourcenote {
+#eklxmlkmul .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -3270,63 +3357,63 @@ fig2_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#cvdhooqdmw .gt_left {
+#eklxmlkmul .gt_left {
   text-align: left;
 }
 
-#cvdhooqdmw .gt_center {
+#eklxmlkmul .gt_center {
   text-align: center;
 }
 
-#cvdhooqdmw .gt_right {
+#eklxmlkmul .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#cvdhooqdmw .gt_font_normal {
+#eklxmlkmul .gt_font_normal {
   font-weight: normal;
 }
 
-#cvdhooqdmw .gt_font_bold {
+#eklxmlkmul .gt_font_bold {
   font-weight: bold;
 }
 
-#cvdhooqdmw .gt_font_italic {
+#eklxmlkmul .gt_font_italic {
   font-style: italic;
 }
 
-#cvdhooqdmw .gt_super {
+#eklxmlkmul .gt_super {
   font-size: 65%;
 }
 
-#cvdhooqdmw .gt_footnote_marks {
+#eklxmlkmul .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#cvdhooqdmw .gt_asterisk {
+#eklxmlkmul .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#cvdhooqdmw .gt_indent_1 {
+#eklxmlkmul .gt_indent_1 {
   text-indent: 5px;
 }
 
-#cvdhooqdmw .gt_indent_2 {
+#eklxmlkmul .gt_indent_2 {
   text-indent: 10px;
 }
 
-#cvdhooqdmw .gt_indent_3 {
+#eklxmlkmul .gt_indent_3 {
   text-indent: 15px;
 }
 
-#cvdhooqdmw .gt_indent_4 {
+#eklxmlkmul .gt_indent_4 {
   text-indent: 20px;
 }
 
-#cvdhooqdmw .gt_indent_5 {
+#eklxmlkmul .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -3340,10 +3427,10 @@ fig2_stat3_protein_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -3358,7 +3445,7 @@ fig2e <- fig2_stat3_protein_result$p
 fig2e
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-36-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-37-1.png)
 
 We export the figure to a PDF file in the Figure2 directory:
 
@@ -3383,7 +3470,7 @@ composite_fig2 <- plot_grid(fig2a, fig2d, fig2b, fig2e, fig2c, fig2c,
 composite_fig2
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-39-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-40-1.png)
 
 ``` r
 ggsave("output/Figure2/composite_fig2.pdf", composite_fig2, 
@@ -3430,23 +3517,23 @@ fig3_ets2_qpcr_result$wilcox_results
 fig3_ets2_qpcr_result$all_wilcox_table
 ```
 
-<div id="lacuatcqbp" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#lacuatcqbp table {
+<div id="eajsjvhwer" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#eajsjvhwer table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#lacuatcqbp thead, #lacuatcqbp tbody, #lacuatcqbp tfoot, #lacuatcqbp tr, #lacuatcqbp td, #lacuatcqbp th {
+#eajsjvhwer thead, #eajsjvhwer tbody, #eajsjvhwer tfoot, #eajsjvhwer tr, #eajsjvhwer td, #eajsjvhwer th {
   border-style: none;
 }
 
-#lacuatcqbp p {
+#eajsjvhwer p {
   margin: 0;
   padding: 0;
 }
 
-#lacuatcqbp .gt_table {
+#eajsjvhwer .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -3472,12 +3559,12 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_caption {
+#eajsjvhwer .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#lacuatcqbp .gt_title {
+#eajsjvhwer .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -3489,7 +3576,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#lacuatcqbp .gt_subtitle {
+#eajsjvhwer .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -3501,7 +3588,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#lacuatcqbp .gt_heading {
+#eajsjvhwer .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -3513,13 +3600,13 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_bottom_border {
+#eajsjvhwer .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_col_headings {
+#eajsjvhwer .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -3534,7 +3621,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_col_heading {
+#eajsjvhwer .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3554,7 +3641,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#lacuatcqbp .gt_column_spanner_outer {
+#eajsjvhwer .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3566,15 +3653,15 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#lacuatcqbp .gt_column_spanner_outer:first-child {
+#eajsjvhwer .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#lacuatcqbp .gt_column_spanner_outer:last-child {
+#eajsjvhwer .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#lacuatcqbp .gt_column_spanner {
+#eajsjvhwer .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -3586,11 +3673,11 @@ fig3_ets2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#lacuatcqbp .gt_spanner_row {
+#eajsjvhwer .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#lacuatcqbp .gt_group_heading {
+#eajsjvhwer .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3616,7 +3703,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#lacuatcqbp .gt_empty_group_heading {
+#eajsjvhwer .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -3631,15 +3718,15 @@ fig3_ets2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#lacuatcqbp .gt_from_md > :first-child {
+#eajsjvhwer .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#lacuatcqbp .gt_from_md > :last-child {
+#eajsjvhwer .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#lacuatcqbp .gt_row {
+#eajsjvhwer .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3658,7 +3745,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#lacuatcqbp .gt_stub {
+#eajsjvhwer .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3671,7 +3758,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#lacuatcqbp .gt_stub_row_group {
+#eajsjvhwer .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -3685,15 +3772,15 @@ fig3_ets2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#lacuatcqbp .gt_row_group_first td {
+#eajsjvhwer .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#lacuatcqbp .gt_row_group_first th {
+#eajsjvhwer .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#lacuatcqbp .gt_summary_row {
+#eajsjvhwer .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -3703,16 +3790,16 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#lacuatcqbp .gt_first_summary_row {
+#eajsjvhwer .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_first_summary_row.thick {
+#eajsjvhwer .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#lacuatcqbp .gt_last_summary_row {
+#eajsjvhwer .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3722,7 +3809,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_grand_summary_row {
+#eajsjvhwer .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -3732,7 +3819,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#lacuatcqbp .gt_first_grand_summary_row {
+#eajsjvhwer .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3742,7 +3829,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_last_grand_summary_row_top {
+#eajsjvhwer .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -3752,11 +3839,11 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_striped {
+#eajsjvhwer .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#lacuatcqbp .gt_table_body {
+#eajsjvhwer .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -3765,7 +3852,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_footnotes {
+#eajsjvhwer .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -3779,7 +3866,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_footnote {
+#eajsjvhwer .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -3788,7 +3875,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#lacuatcqbp .gt_sourcenotes {
+#eajsjvhwer .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -3802,7 +3889,7 @@ fig3_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#lacuatcqbp .gt_sourcenote {
+#eajsjvhwer .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -3810,63 +3897,63 @@ fig3_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#lacuatcqbp .gt_left {
+#eajsjvhwer .gt_left {
   text-align: left;
 }
 
-#lacuatcqbp .gt_center {
+#eajsjvhwer .gt_center {
   text-align: center;
 }
 
-#lacuatcqbp .gt_right {
+#eajsjvhwer .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#lacuatcqbp .gt_font_normal {
+#eajsjvhwer .gt_font_normal {
   font-weight: normal;
 }
 
-#lacuatcqbp .gt_font_bold {
+#eajsjvhwer .gt_font_bold {
   font-weight: bold;
 }
 
-#lacuatcqbp .gt_font_italic {
+#eajsjvhwer .gt_font_italic {
   font-style: italic;
 }
 
-#lacuatcqbp .gt_super {
+#eajsjvhwer .gt_super {
   font-size: 65%;
 }
 
-#lacuatcqbp .gt_footnote_marks {
+#eajsjvhwer .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#lacuatcqbp .gt_asterisk {
+#eajsjvhwer .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#lacuatcqbp .gt_indent_1 {
+#eajsjvhwer .gt_indent_1 {
   text-indent: 5px;
 }
 
-#lacuatcqbp .gt_indent_2 {
+#eajsjvhwer .gt_indent_2 {
   text-indent: 10px;
 }
 
-#lacuatcqbp .gt_indent_3 {
+#eajsjvhwer .gt_indent_3 {
   text-indent: 15px;
 }
 
-#lacuatcqbp .gt_indent_4 {
+#eajsjvhwer .gt_indent_4 {
   text-indent: 20px;
 }
 
-#lacuatcqbp .gt_indent_5 {
+#eajsjvhwer .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -3882,367 +3969,367 @@ fig3_ets2_qpcr_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.7922</td>
+<td headers="P_value" class="gt_row gt_right">0.792207792</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">31.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0411</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">32.0</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">31.0</td>
+<td headers="P_value" class="gt_row gt_right">0.041125541</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">29.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0931</td>
+<td headers="P_value" class="gt_row gt_right">0.093073593</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">32.0</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">26.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2403</td>
+<td headers="P_value" class="gt_row gt_right">0.240259740</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">23.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0190</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">35.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">30.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">23.0</td>
+<td headers="P_value" class="gt_row gt_right">0.019047619</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">35.0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">30.0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.9307</td>
+<td headers="P_value" class="gt_row gt_right">0.930735931</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">18.5</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">23.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4848</td>
+<td headers="P_value" class="gt_row gt_right">0.484848485</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4762</td>
+<td headers="P_value" class="gt_row gt_right">0.476190476</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">26.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2403</td>
+<td headers="P_value" class="gt_row gt_right">0.240259740</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">27.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1797</td>
+<td headers="P_value" class="gt_row gt_right">0.179653680</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">21.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3290</td>
+<td headers="P_value" class="gt_row gt_right">0.329004329</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">28.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.7922</td>
+<td headers="P_value" class="gt_row gt_right">0.792207792</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">23.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1775</td>
+<td headers="P_value" class="gt_row gt_right">0.177489177</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">22.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2468</td>
+<td headers="P_value" class="gt_row gt_right">0.246753247</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6623</td>
+<td headers="P_value" class="gt_row gt_right">0.662337662</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6623</td>
+<td headers="P_value" class="gt_row gt_right">0.662337662</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2857</td>
+<td headers="P_value" class="gt_row gt_right">0.285714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">26.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0519</td>
+<td headers="P_value" class="gt_row gt_right">0.051948052</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">28.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0173</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">28.0</td>
+<td headers="P_value" class="gt_row gt_right">0.017316017</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">22.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0556</td>
+<td headers="P_value" class="gt_row gt_right">0.055555556</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">29.5</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0104</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">29.5</td>
+<td headers="P_value" class="gt_row gt_right">0.010411098</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">25.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3095</td>
+<td headers="P_value" class="gt_row gt_right">0.309523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">19.0</td>
-<td headers="P_value" class="gt_row gt_right">0.9372</td>
+<td headers="P_value" class="gt_row gt_right">0.937229437</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4762</td>
+<td headers="P_value" class="gt_row gt_right">0.476190476</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">29.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0931</td>
+<td headers="P_value" class="gt_row gt_right">0.093073593</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">30.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1255</td>
+<td headers="P_value" class="gt_row gt_right">0.125541126</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">32.0</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">23.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4848</td>
+<td headers="P_value" class="gt_row gt_right">0.484848485</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">19.5</td>
-<td headers="P_value" class="gt_row gt_right">0.8726</td>
+<td headers="P_value" class="gt_row gt_right">0.872559031</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.9372</td>
+<td headers="P_value" class="gt_row gt_right">0.937229437</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3524</td>
+<td headers="P_value" class="gt_row gt_right">0.352380952</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">30.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">34.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0087</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">30.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">34.0</td>
+<td headers="P_value" class="gt_row gt_right">0.008658009</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">30.0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.5887</td>
+<td headers="P_value" class="gt_row gt_right">0.588744589</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">11.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3095</td>
+<td headers="P_value" class="gt_row gt_right">0.309523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">13.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4848</td>
+<td headers="P_value" class="gt_row gt_right">0.484848485</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">10.0</td>
-<td headers="P_value" class="gt_row gt_right">0.7619</td>
+<td headers="P_value" class="gt_row gt_right">0.761904762</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">20.5</td>
-<td headers="P_value" class="gt_row gt_right">0.7483</td>
+<td headers="P_value" class="gt_row gt_right">0.748348569</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">28.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1255</td>
+<td headers="P_value" class="gt_row gt_right">0.125541126</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">25.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3095</td>
+<td headers="P_value" class="gt_row gt_right">0.309523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.5887</td>
+<td headers="P_value" class="gt_row gt_right">0.588744589</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4762</td>
+<td headers="P_value" class="gt_row gt_right">0.476190476</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">26.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2403</td>
+<td headers="P_value" class="gt_row gt_right">0.240259740</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">30.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">23.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1775</td>
+<td headers="P_value" class="gt_row gt_right">0.177489177</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">30.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.9372</td>
+<td headers="P_value" class="gt_row gt_right">0.937229437</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4762</td>
+<td headers="P_value" class="gt_row gt_right">0.476190476</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">30.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">30.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">30.0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4762</td>
+<td headers="P_value" class="gt_row gt_right">0.476190476</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">28.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">27.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0303</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">32.0</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">27.0</td>
+<td headers="P_value" class="gt_row gt_right">0.030303030</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">32.0</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.7619</td>
+<td headers="P_value" class="gt_row gt_right">0.761904762</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">19.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1714</td>
+<td headers="P_value" class="gt_row gt_right">0.171428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1905</td>
+<td headers="P_value" class="gt_row gt_right">0.190476190</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3524</td>
+<td headers="P_value" class="gt_row gt_right">0.352380952</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">24.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">17.0</td>
-<td headers="P_value" class="gt_row gt_right">0.7922</td>
+<td headers="P_value" class="gt_row gt_right">0.792207792</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">22.0</td>
-<td headers="P_value" class="gt_row gt_right">0.5887</td>
+<td headers="P_value" class="gt_row gt_right">0.588744589</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.9307</td>
+<td headers="P_value" class="gt_row gt_right">0.930735931</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">16.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">18.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6623</td>
+<td headers="P_value" class="gt_row gt_right">0.662337662</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -4258,7 +4345,7 @@ fig3a <- fig3_ets2_qpcr_result$p
 fig3a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-46-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-47-1.png)
 
 We export the figure to a PDF file in the Figure3 directory:
 
@@ -4292,23 +4379,23 @@ fig3_ets2_protein_result_new <- compare_protein_groups(
 fig3_ets2_protein_result_new$all_wilcox_table
 ```
 
-<div id="tztohzmxsf" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#tztohzmxsf table {
+<div id="kravymllfr" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#kravymllfr table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#tztohzmxsf thead, #tztohzmxsf tbody, #tztohzmxsf tfoot, #tztohzmxsf tr, #tztohzmxsf td, #tztohzmxsf th {
+#kravymllfr thead, #kravymllfr tbody, #kravymllfr tfoot, #kravymllfr tr, #kravymllfr td, #kravymllfr th {
   border-style: none;
 }
 
-#tztohzmxsf p {
+#kravymllfr p {
   margin: 0;
   padding: 0;
 }
 
-#tztohzmxsf .gt_table {
+#kravymllfr .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -4334,12 +4421,12 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_caption {
+#kravymllfr .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#tztohzmxsf .gt_title {
+#kravymllfr .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -4351,7 +4438,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#tztohzmxsf .gt_subtitle {
+#kravymllfr .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -4363,7 +4450,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-top-width: 0;
 }
 
-#tztohzmxsf .gt_heading {
+#kravymllfr .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -4375,13 +4462,13 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_bottom_border {
+#kravymllfr .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_col_headings {
+#kravymllfr .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -4396,7 +4483,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_col_heading {
+#kravymllfr .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -4416,7 +4503,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tztohzmxsf .gt_column_spanner_outer {
+#kravymllfr .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -4428,15 +4515,15 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 4px;
 }
 
-#tztohzmxsf .gt_column_spanner_outer:first-child {
+#kravymllfr .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#tztohzmxsf .gt_column_spanner_outer:last-child {
+#kravymllfr .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#tztohzmxsf .gt_column_spanner {
+#kravymllfr .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -4448,11 +4535,11 @@ fig3_ets2_protein_result_new$all_wilcox_table
   width: 100%;
 }
 
-#tztohzmxsf .gt_spanner_row {
+#kravymllfr .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#tztohzmxsf .gt_group_heading {
+#kravymllfr .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -4478,7 +4565,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   text-align: left;
 }
 
-#tztohzmxsf .gt_empty_group_heading {
+#kravymllfr .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -4493,15 +4580,15 @@ fig3_ets2_protein_result_new$all_wilcox_table
   vertical-align: middle;
 }
 
-#tztohzmxsf .gt_from_md > :first-child {
+#kravymllfr .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#tztohzmxsf .gt_from_md > :last-child {
+#kravymllfr .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#tztohzmxsf .gt_row {
+#kravymllfr .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -4520,7 +4607,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tztohzmxsf .gt_stub {
+#kravymllfr .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -4533,7 +4620,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 5px;
 }
 
-#tztohzmxsf .gt_stub_row_group {
+#kravymllfr .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -4547,15 +4634,15 @@ fig3_ets2_protein_result_new$all_wilcox_table
   vertical-align: top;
 }
 
-#tztohzmxsf .gt_row_group_first td {
+#kravymllfr .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#tztohzmxsf .gt_row_group_first th {
+#kravymllfr .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#tztohzmxsf .gt_summary_row {
+#kravymllfr .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -4565,16 +4652,16 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 5px;
 }
 
-#tztohzmxsf .gt_first_summary_row {
+#kravymllfr .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_first_summary_row.thick {
+#kravymllfr .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#tztohzmxsf .gt_last_summary_row {
+#kravymllfr .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -4584,7 +4671,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_grand_summary_row {
+#kravymllfr .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -4594,7 +4681,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 5px;
 }
 
-#tztohzmxsf .gt_first_grand_summary_row {
+#kravymllfr .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -4604,7 +4691,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_last_grand_summary_row_top {
+#kravymllfr .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -4614,11 +4701,11 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_striped {
+#kravymllfr .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#tztohzmxsf .gt_table_body {
+#kravymllfr .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -4627,7 +4714,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_footnotes {
+#kravymllfr .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -4641,7 +4728,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_footnote {
+#kravymllfr .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -4650,7 +4737,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 5px;
 }
 
-#tztohzmxsf .gt_sourcenotes {
+#kravymllfr .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -4664,7 +4751,7 @@ fig3_ets2_protein_result_new$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tztohzmxsf .gt_sourcenote {
+#kravymllfr .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -4672,63 +4759,63 @@ fig3_ets2_protein_result_new$all_wilcox_table
   padding-right: 5px;
 }
 
-#tztohzmxsf .gt_left {
+#kravymllfr .gt_left {
   text-align: left;
 }
 
-#tztohzmxsf .gt_center {
+#kravymllfr .gt_center {
   text-align: center;
 }
 
-#tztohzmxsf .gt_right {
+#kravymllfr .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#tztohzmxsf .gt_font_normal {
+#kravymllfr .gt_font_normal {
   font-weight: normal;
 }
 
-#tztohzmxsf .gt_font_bold {
+#kravymllfr .gt_font_bold {
   font-weight: bold;
 }
 
-#tztohzmxsf .gt_font_italic {
+#kravymllfr .gt_font_italic {
   font-style: italic;
 }
 
-#tztohzmxsf .gt_super {
+#kravymllfr .gt_super {
   font-size: 65%;
 }
 
-#tztohzmxsf .gt_footnote_marks {
+#kravymllfr .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#tztohzmxsf .gt_asterisk {
+#kravymllfr .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#tztohzmxsf .gt_indent_1 {
+#kravymllfr .gt_indent_1 {
   text-indent: 5px;
 }
 
-#tztohzmxsf .gt_indent_2 {
+#kravymllfr .gt_indent_2 {
   text-indent: 10px;
 }
 
-#tztohzmxsf .gt_indent_3 {
+#kravymllfr .gt_indent_3 {
   text-indent: 15px;
 }
 
-#tztohzmxsf .gt_indent_4 {
+#kravymllfr .gt_indent_4 {
   text-indent: 20px;
 }
 
-#tztohzmxsf .gt_indent_5 {
+#kravymllfr .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -4744,368 +4831,368 @@ fig3_ets2_protein_result_new$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">23</td>
-<td headers="P_value" class="gt_row gt_right">0.4848</td>
+<td headers="P_value" class="gt_row gt_right">0.484848485</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">34</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0087</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">34</td>
+<td headers="P_value" class="gt_row gt_right">0.008658009</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">27</td>
-<td headers="P_value" class="gt_row gt_right">0.1797</td>
+<td headers="P_value" class="gt_row gt_right">0.179653680</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">35</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
+<td headers="Statistic" class="gt_row gt_right">35</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">22</td>
-<td headers="P_value" class="gt_row gt_right">0.5887</td>
+<td headers="P_value" class="gt_row gt_right">0.588744589</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">25</td>
-<td headers="P_value" class="gt_row gt_right">0.3095</td>
+<td headers="P_value" class="gt_row gt_right">0.309523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">18</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">20</td>
-<td headers="P_value" class="gt_row gt_right">0.8182</td>
+<td headers="P_value" class="gt_row gt_right">0.818181818</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">25</td>
-<td headers="P_value" class="gt_row gt_right">0.3095</td>
+<td headers="P_value" class="gt_row gt_right">0.309523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">24</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">30</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">24</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">24</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">23</td>
-<td headers="P_value" class="gt_row gt_right">0.4848</td>
+<td headers="P_value" class="gt_row gt_right">0.484848485</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_100 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">32</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">32</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">24</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">28</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.1320</td>
+<td headers="P_value" class="gt_row gt_right">0.132034632</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_250 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">4</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">4</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">24</td>
-<td headers="P_value" class="gt_row gt_right">0.3939</td>
+<td headers="P_value" class="gt_row gt_right">0.393939394</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">3</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0152</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">4</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0260</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">3</td>
+<td headers="P_value" class="gt_row gt_right">0.015151515</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">4</td>
+<td headers="P_value" class="gt_row gt_right">0.025974026</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -5120,7 +5207,7 @@ fig3b_new <- fig3_ets2_protein_result_new$p
 fig3b_new
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-52-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-53-1.png)
 
 We export the figure to a PDF file in the Figure3 directory:
 
@@ -5154,23 +5241,23 @@ fig3_stat3_protein_result <- compare_protein_groups(
 fig3_stat3_protein_result$all_wilcox_table
 ```
 
-<div id="ulyljyyquu" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#ulyljyyquu table {
+<div id="qftldseagb" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#qftldseagb table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#ulyljyyquu thead, #ulyljyyquu tbody, #ulyljyyquu tfoot, #ulyljyyquu tr, #ulyljyyquu td, #ulyljyyquu th {
+#qftldseagb thead, #qftldseagb tbody, #qftldseagb tfoot, #qftldseagb tr, #qftldseagb td, #qftldseagb th {
   border-style: none;
 }
 
-#ulyljyyquu p {
+#qftldseagb p {
   margin: 0;
   padding: 0;
 }
 
-#ulyljyyquu .gt_table {
+#qftldseagb .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -5196,12 +5283,12 @@ fig3_stat3_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_caption {
+#qftldseagb .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#ulyljyyquu .gt_title {
+#qftldseagb .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -5213,7 +5300,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#ulyljyyquu .gt_subtitle {
+#qftldseagb .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -5225,7 +5312,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#ulyljyyquu .gt_heading {
+#qftldseagb .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -5237,13 +5324,13 @@ fig3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_bottom_border {
+#qftldseagb .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_col_headings {
+#qftldseagb .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -5258,7 +5345,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_col_heading {
+#qftldseagb .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -5278,7 +5365,7 @@ fig3_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#ulyljyyquu .gt_column_spanner_outer {
+#qftldseagb .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -5290,15 +5377,15 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#ulyljyyquu .gt_column_spanner_outer:first-child {
+#qftldseagb .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#ulyljyyquu .gt_column_spanner_outer:last-child {
+#qftldseagb .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#ulyljyyquu .gt_column_spanner {
+#qftldseagb .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -5310,11 +5397,11 @@ fig3_stat3_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#ulyljyyquu .gt_spanner_row {
+#qftldseagb .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#ulyljyyquu .gt_group_heading {
+#qftldseagb .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -5340,7 +5427,7 @@ fig3_stat3_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#ulyljyyquu .gt_empty_group_heading {
+#qftldseagb .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -5355,15 +5442,15 @@ fig3_stat3_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#ulyljyyquu .gt_from_md > :first-child {
+#qftldseagb .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#ulyljyyquu .gt_from_md > :last-child {
+#qftldseagb .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#ulyljyyquu .gt_row {
+#qftldseagb .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -5382,7 +5469,7 @@ fig3_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#ulyljyyquu .gt_stub {
+#qftldseagb .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -5395,7 +5482,7 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ulyljyyquu .gt_stub_row_group {
+#qftldseagb .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -5409,15 +5496,15 @@ fig3_stat3_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#ulyljyyquu .gt_row_group_first td {
+#qftldseagb .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#ulyljyyquu .gt_row_group_first th {
+#qftldseagb .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#ulyljyyquu .gt_summary_row {
+#qftldseagb .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -5427,16 +5514,16 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ulyljyyquu .gt_first_summary_row {
+#qftldseagb .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_first_summary_row.thick {
+#qftldseagb .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#ulyljyyquu .gt_last_summary_row {
+#qftldseagb .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -5446,7 +5533,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_grand_summary_row {
+#qftldseagb .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -5456,7 +5543,7 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ulyljyyquu .gt_first_grand_summary_row {
+#qftldseagb .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -5466,7 +5553,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_last_grand_summary_row_top {
+#qftldseagb .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -5476,11 +5563,11 @@ fig3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_striped {
+#qftldseagb .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#ulyljyyquu .gt_table_body {
+#qftldseagb .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -5489,7 +5576,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_footnotes {
+#qftldseagb .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -5503,7 +5590,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_footnote {
+#qftldseagb .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -5512,7 +5599,7 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ulyljyyquu .gt_sourcenotes {
+#qftldseagb .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -5526,7 +5613,7 @@ fig3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ulyljyyquu .gt_sourcenote {
+#qftldseagb .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -5534,63 +5621,63 @@ fig3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ulyljyyquu .gt_left {
+#qftldseagb .gt_left {
   text-align: left;
 }
 
-#ulyljyyquu .gt_center {
+#qftldseagb .gt_center {
   text-align: center;
 }
 
-#ulyljyyquu .gt_right {
+#qftldseagb .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#ulyljyyquu .gt_font_normal {
+#qftldseagb .gt_font_normal {
   font-weight: normal;
 }
 
-#ulyljyyquu .gt_font_bold {
+#qftldseagb .gt_font_bold {
   font-weight: bold;
 }
 
-#ulyljyyquu .gt_font_italic {
+#qftldseagb .gt_font_italic {
   font-style: italic;
 }
 
-#ulyljyyquu .gt_super {
+#qftldseagb .gt_super {
   font-size: 65%;
 }
 
-#ulyljyyquu .gt_footnote_marks {
+#qftldseagb .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#ulyljyyquu .gt_asterisk {
+#qftldseagb .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#ulyljyyquu .gt_indent_1 {
+#qftldseagb .gt_indent_1 {
   text-indent: 5px;
 }
 
-#ulyljyyquu .gt_indent_2 {
+#qftldseagb .gt_indent_2 {
   text-indent: 10px;
 }
 
-#ulyljyyquu .gt_indent_3 {
+#qftldseagb .gt_indent_3 {
   text-indent: 15px;
 }
 
-#ulyljyyquu .gt_indent_4 {
+#qftldseagb .gt_indent_4 {
   text-indent: 20px;
 }
 
-#ulyljyyquu .gt_indent_5 {
+#qftldseagb .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -5606,368 +5693,368 @@ fig3_stat3_protein_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="P_value" class="gt_row gt_right">0.40000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="P_value" class="gt_row gt_right">0.40000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8571</td>
+<td headers="P_value" class="gt_row gt_right">0.85714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="P_value" class="gt_row gt_right">0.10000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.7000</td>
+<td headers="P_value" class="gt_row gt_right">0.70000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.7000</td>
+<td headers="P_value" class="gt_row gt_right">0.70000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="P_value" class="gt_row gt_right">0.10000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="P_value" class="gt_row gt_right">0.40000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="P_value" class="gt_row gt_right">0.40000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">5</td>
-<td headers="P_value" class="gt_row gt_right">0.8571</td>
+<td headers="P_value" class="gt_row gt_right">0.85714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.2286</td>
+<td headers="P_value" class="gt_row gt_right">0.22857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.2286</td>
+<td headers="P_value" class="gt_row gt_right">0.22857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">11</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_100 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_250 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -5982,7 +6069,7 @@ fig3d <- fig3_stat3_protein_result$p
 fig3d
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-58-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-59-1.png)
 
 We export the figure to a PDF file in the Figure3 directory:
 
@@ -6016,23 +6103,23 @@ fig3_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
 fig3_il2_qpcr_result$all_wilcox_table
 ```
 
-<div id="aczwikvgrg" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#aczwikvgrg table {
+<div id="ozcplrathe" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#ozcplrathe table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#aczwikvgrg thead, #aczwikvgrg tbody, #aczwikvgrg tfoot, #aczwikvgrg tr, #aczwikvgrg td, #aczwikvgrg th {
+#ozcplrathe thead, #ozcplrathe tbody, #ozcplrathe tfoot, #ozcplrathe tr, #ozcplrathe td, #ozcplrathe th {
   border-style: none;
 }
 
-#aczwikvgrg p {
+#ozcplrathe p {
   margin: 0;
   padding: 0;
 }
 
-#aczwikvgrg .gt_table {
+#ozcplrathe .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -6058,12 +6145,12 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_caption {
+#ozcplrathe .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#aczwikvgrg .gt_title {
+#ozcplrathe .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -6075,7 +6162,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#aczwikvgrg .gt_subtitle {
+#ozcplrathe .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -6087,7 +6174,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#aczwikvgrg .gt_heading {
+#ozcplrathe .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -6099,13 +6186,13 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_bottom_border {
+#ozcplrathe .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_col_headings {
+#ozcplrathe .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -6120,7 +6207,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_col_heading {
+#ozcplrathe .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6140,7 +6227,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#aczwikvgrg .gt_column_spanner_outer {
+#ozcplrathe .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6152,15 +6239,15 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#aczwikvgrg .gt_column_spanner_outer:first-child {
+#ozcplrathe .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#aczwikvgrg .gt_column_spanner_outer:last-child {
+#ozcplrathe .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#aczwikvgrg .gt_column_spanner {
+#ozcplrathe .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -6172,11 +6259,11 @@ fig3_il2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#aczwikvgrg .gt_spanner_row {
+#ozcplrathe .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#aczwikvgrg .gt_group_heading {
+#ozcplrathe .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6202,7 +6289,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#aczwikvgrg .gt_empty_group_heading {
+#ozcplrathe .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -6217,15 +6304,15 @@ fig3_il2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#aczwikvgrg .gt_from_md > :first-child {
+#ozcplrathe .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#aczwikvgrg .gt_from_md > :last-child {
+#ozcplrathe .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#aczwikvgrg .gt_row {
+#ozcplrathe .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6244,7 +6331,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#aczwikvgrg .gt_stub {
+#ozcplrathe .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6257,7 +6344,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aczwikvgrg .gt_stub_row_group {
+#ozcplrathe .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6271,15 +6358,15 @@ fig3_il2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#aczwikvgrg .gt_row_group_first td {
+#ozcplrathe .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#aczwikvgrg .gt_row_group_first th {
+#ozcplrathe .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#aczwikvgrg .gt_summary_row {
+#ozcplrathe .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -6289,16 +6376,16 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aczwikvgrg .gt_first_summary_row {
+#ozcplrathe .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_first_summary_row.thick {
+#ozcplrathe .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#aczwikvgrg .gt_last_summary_row {
+#ozcplrathe .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6308,7 +6395,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_grand_summary_row {
+#ozcplrathe .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -6318,7 +6405,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aczwikvgrg .gt_first_grand_summary_row {
+#ozcplrathe .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6328,7 +6415,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_last_grand_summary_row_top {
+#ozcplrathe .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6338,11 +6425,11 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_striped {
+#ozcplrathe .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#aczwikvgrg .gt_table_body {
+#ozcplrathe .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -6351,7 +6438,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_footnotes {
+#ozcplrathe .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -6365,7 +6452,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_footnote {
+#ozcplrathe .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -6374,7 +6461,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aczwikvgrg .gt_sourcenotes {
+#ozcplrathe .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -6388,7 +6475,7 @@ fig3_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aczwikvgrg .gt_sourcenote {
+#ozcplrathe .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -6396,63 +6483,63 @@ fig3_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aczwikvgrg .gt_left {
+#ozcplrathe .gt_left {
   text-align: left;
 }
 
-#aczwikvgrg .gt_center {
+#ozcplrathe .gt_center {
   text-align: center;
 }
 
-#aczwikvgrg .gt_right {
+#ozcplrathe .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#aczwikvgrg .gt_font_normal {
+#ozcplrathe .gt_font_normal {
   font-weight: normal;
 }
 
-#aczwikvgrg .gt_font_bold {
+#ozcplrathe .gt_font_bold {
   font-weight: bold;
 }
 
-#aczwikvgrg .gt_font_italic {
+#ozcplrathe .gt_font_italic {
   font-style: italic;
 }
 
-#aczwikvgrg .gt_super {
+#ozcplrathe .gt_super {
   font-size: 65%;
 }
 
-#aczwikvgrg .gt_footnote_marks {
+#ozcplrathe .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#aczwikvgrg .gt_asterisk {
+#ozcplrathe .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#aczwikvgrg .gt_indent_1 {
+#ozcplrathe .gt_indent_1 {
   text-indent: 5px;
 }
 
-#aczwikvgrg .gt_indent_2 {
+#ozcplrathe .gt_indent_2 {
   text-indent: 10px;
 }
 
-#aczwikvgrg .gt_indent_3 {
+#ozcplrathe .gt_indent_3 {
   text-indent: 15px;
 }
 
-#aczwikvgrg .gt_indent_4 {
+#ozcplrathe .gt_indent_4 {
   text-indent: 20px;
 }
 
-#aczwikvgrg .gt_indent_5 {
+#ozcplrathe .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -6466,118 +6553,118 @@ fig3_il2_qpcr_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_VCT</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.6286</td>
+<td headers="P_value" class="gt_row gt_right">0.62857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">5</td>
-<td headers="P_value" class="gt_row gt_right">0.8571</td>
+<td headers="P_value" class="gt_row gt_right">0.85714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -6592,7 +6679,7 @@ fig3f <- fig3_il2_qpcr_result$p
 fig3f
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-64-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-65-1.png)
 
 We export the figure to a PDF file in the Figure3 directory:
 
@@ -6616,7 +6703,7 @@ composite_fig3 <- plot_grid(fig3a, fig3d, fig3b_new, fig3f, fig3f, fig3f,
 composite_fig3
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-67-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-68-1.png)
 
 We save the composite Figure 3 to a file:
 
@@ -6665,7 +6752,7 @@ fig4a <- fig4_stat3_qpcr_result$p
 fig4a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-73-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-74-1.png)
 
 We save the figure to a PDF file in the Figure4 directory:
 
@@ -6707,23 +6794,23 @@ fig4_ets2_qpcr_result$wilcox_results
 fig4_ets2_qpcr_result$all_wilcox_table
 ```
 
-<div id="kxdgfmuyja" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#kxdgfmuyja table {
+<div id="yuduowrhzq" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#yuduowrhzq table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#kxdgfmuyja thead, #kxdgfmuyja tbody, #kxdgfmuyja tfoot, #kxdgfmuyja tr, #kxdgfmuyja td, #kxdgfmuyja th {
+#yuduowrhzq thead, #yuduowrhzq tbody, #yuduowrhzq tfoot, #yuduowrhzq tr, #yuduowrhzq td, #yuduowrhzq th {
   border-style: none;
 }
 
-#kxdgfmuyja p {
+#yuduowrhzq p {
   margin: 0;
   padding: 0;
 }
 
-#kxdgfmuyja .gt_table {
+#yuduowrhzq .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -6749,12 +6836,12 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_caption {
+#yuduowrhzq .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#kxdgfmuyja .gt_title {
+#yuduowrhzq .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -6766,7 +6853,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#kxdgfmuyja .gt_subtitle {
+#yuduowrhzq .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -6778,7 +6865,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#kxdgfmuyja .gt_heading {
+#yuduowrhzq .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -6790,13 +6877,13 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_bottom_border {
+#yuduowrhzq .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_col_headings {
+#yuduowrhzq .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -6811,7 +6898,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_col_heading {
+#yuduowrhzq .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6831,7 +6918,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#kxdgfmuyja .gt_column_spanner_outer {
+#yuduowrhzq .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6843,15 +6930,15 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#kxdgfmuyja .gt_column_spanner_outer:first-child {
+#yuduowrhzq .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#kxdgfmuyja .gt_column_spanner_outer:last-child {
+#yuduowrhzq .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#kxdgfmuyja .gt_column_spanner {
+#yuduowrhzq .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -6863,11 +6950,11 @@ fig4_ets2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#kxdgfmuyja .gt_spanner_row {
+#yuduowrhzq .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#kxdgfmuyja .gt_group_heading {
+#yuduowrhzq .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6893,7 +6980,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#kxdgfmuyja .gt_empty_group_heading {
+#yuduowrhzq .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -6908,15 +6995,15 @@ fig4_ets2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#kxdgfmuyja .gt_from_md > :first-child {
+#yuduowrhzq .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#kxdgfmuyja .gt_from_md > :last-child {
+#yuduowrhzq .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#kxdgfmuyja .gt_row {
+#yuduowrhzq .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6935,7 +7022,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#kxdgfmuyja .gt_stub {
+#yuduowrhzq .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6948,7 +7035,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kxdgfmuyja .gt_stub_row_group {
+#yuduowrhzq .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -6962,15 +7049,15 @@ fig4_ets2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#kxdgfmuyja .gt_row_group_first td {
+#yuduowrhzq .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#kxdgfmuyja .gt_row_group_first th {
+#yuduowrhzq .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#kxdgfmuyja .gt_summary_row {
+#yuduowrhzq .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -6980,16 +7067,16 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kxdgfmuyja .gt_first_summary_row {
+#yuduowrhzq .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_first_summary_row.thick {
+#yuduowrhzq .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#kxdgfmuyja .gt_last_summary_row {
+#yuduowrhzq .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -6999,7 +7086,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_grand_summary_row {
+#yuduowrhzq .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -7009,7 +7096,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kxdgfmuyja .gt_first_grand_summary_row {
+#yuduowrhzq .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7019,7 +7106,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_last_grand_summary_row_top {
+#yuduowrhzq .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7029,11 +7116,11 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_striped {
+#yuduowrhzq .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#kxdgfmuyja .gt_table_body {
+#yuduowrhzq .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -7042,7 +7129,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_footnotes {
+#yuduowrhzq .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -7056,7 +7143,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_footnote {
+#yuduowrhzq .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -7065,7 +7152,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kxdgfmuyja .gt_sourcenotes {
+#yuduowrhzq .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -7079,7 +7166,7 @@ fig4_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kxdgfmuyja .gt_sourcenote {
+#yuduowrhzq .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -7087,63 +7174,63 @@ fig4_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kxdgfmuyja .gt_left {
+#yuduowrhzq .gt_left {
   text-align: left;
 }
 
-#kxdgfmuyja .gt_center {
+#yuduowrhzq .gt_center {
   text-align: center;
 }
 
-#kxdgfmuyja .gt_right {
+#yuduowrhzq .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#kxdgfmuyja .gt_font_normal {
+#yuduowrhzq .gt_font_normal {
   font-weight: normal;
 }
 
-#kxdgfmuyja .gt_font_bold {
+#yuduowrhzq .gt_font_bold {
   font-weight: bold;
 }
 
-#kxdgfmuyja .gt_font_italic {
+#yuduowrhzq .gt_font_italic {
   font-style: italic;
 }
 
-#kxdgfmuyja .gt_super {
+#yuduowrhzq .gt_super {
   font-size: 65%;
 }
 
-#kxdgfmuyja .gt_footnote_marks {
+#yuduowrhzq .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#kxdgfmuyja .gt_asterisk {
+#yuduowrhzq .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#kxdgfmuyja .gt_indent_1 {
+#yuduowrhzq .gt_indent_1 {
   text-indent: 5px;
 }
 
-#kxdgfmuyja .gt_indent_2 {
+#yuduowrhzq .gt_indent_2 {
   text-indent: 10px;
 }
 
-#kxdgfmuyja .gt_indent_3 {
+#yuduowrhzq .gt_indent_3 {
   text-indent: 15px;
 }
 
-#kxdgfmuyja .gt_indent_4 {
+#yuduowrhzq .gt_indent_4 {
   text-indent: 20px;
 }
 
-#kxdgfmuyja .gt_indent_5 {
+#yuduowrhzq .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -7159,64 +7246,64 @@ fig4_ets2_qpcr_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">11.0</td>
-<td headers="P_value" class="gt_row gt_right">0.5368</td>
+<td headers="P_value" class="gt_row gt_right">0.536796537</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">1.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0317</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">30.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">30.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0080</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">1.0</td>
+<td headers="P_value" class="gt_row gt_right">0.031746032</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">30.0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">30.0</td>
+<td headers="P_value" class="gt_row gt_right">0.007969413</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs CM SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">3.5</td>
-<td headers="P_value" class="gt_row gt_right">0.0871</td>
+<td headers="P_value" class="gt_row gt_right">0.087118437</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">34.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0129</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">36.0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">34.0</td>
+<td headers="P_value" class="gt_row gt_right">0.012906570</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.5887</td>
+<td headers="P_value" class="gt_row gt_right">0.588744589</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">24.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0095</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">24.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0139</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">24.0</td>
+<td headers="P_value" class="gt_row gt_right">0.009523810</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">24.0</td>
+<td headers="P_value" class="gt_row gt_right">0.013921913</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6095</td>
+<td headers="P_value" class="gt_row gt_right">0.609523810</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">26.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2290</td>
+<td headers="P_value" class="gt_row gt_right">0.228950681</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">2.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0087</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI SI GAPDH vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">3.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0200</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">2.0</td>
+<td headers="P_value" class="gt_row gt_right">0.008658009</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI SI GAPDH vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">3.0</td>
+<td headers="P_value" class="gt_row gt_right">0.020022387</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -7231,7 +7318,7 @@ fig4b <- fig4_ets2_qpcr_result$p
 fig4b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-80-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-81-1.png)
 
 We save the figure to a PDF file in the Figure4 directory:
 
@@ -7273,23 +7360,23 @@ fig4_il2_qpcr_result$wilcox_results
 fig4_il2_qpcr_result$all_wilcox_table
 ```
 
-<div id="hhpkwcvmrp" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#hhpkwcvmrp table {
+<div id="llalzxtpus" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#llalzxtpus table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#hhpkwcvmrp thead, #hhpkwcvmrp tbody, #hhpkwcvmrp tfoot, #hhpkwcvmrp tr, #hhpkwcvmrp td, #hhpkwcvmrp th {
+#llalzxtpus thead, #llalzxtpus tbody, #llalzxtpus tfoot, #llalzxtpus tr, #llalzxtpus td, #llalzxtpus th {
   border-style: none;
 }
 
-#hhpkwcvmrp p {
+#llalzxtpus p {
   margin: 0;
   padding: 0;
 }
 
-#hhpkwcvmrp .gt_table {
+#llalzxtpus .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -7315,12 +7402,12 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_caption {
+#llalzxtpus .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#hhpkwcvmrp .gt_title {
+#llalzxtpus .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -7332,7 +7419,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#hhpkwcvmrp .gt_subtitle {
+#llalzxtpus .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -7344,7 +7431,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#hhpkwcvmrp .gt_heading {
+#llalzxtpus .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -7356,13 +7443,13 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_bottom_border {
+#llalzxtpus .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_col_headings {
+#llalzxtpus .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -7377,7 +7464,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_col_heading {
+#llalzxtpus .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7397,7 +7484,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#hhpkwcvmrp .gt_column_spanner_outer {
+#llalzxtpus .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7409,15 +7496,15 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#hhpkwcvmrp .gt_column_spanner_outer:first-child {
+#llalzxtpus .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#hhpkwcvmrp .gt_column_spanner_outer:last-child {
+#llalzxtpus .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#hhpkwcvmrp .gt_column_spanner {
+#llalzxtpus .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -7429,11 +7516,11 @@ fig4_il2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#hhpkwcvmrp .gt_spanner_row {
+#llalzxtpus .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#hhpkwcvmrp .gt_group_heading {
+#llalzxtpus .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7459,7 +7546,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#hhpkwcvmrp .gt_empty_group_heading {
+#llalzxtpus .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -7474,15 +7561,15 @@ fig4_il2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#hhpkwcvmrp .gt_from_md > :first-child {
+#llalzxtpus .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#hhpkwcvmrp .gt_from_md > :last-child {
+#llalzxtpus .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#hhpkwcvmrp .gt_row {
+#llalzxtpus .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7501,7 +7588,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#hhpkwcvmrp .gt_stub {
+#llalzxtpus .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7514,7 +7601,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hhpkwcvmrp .gt_stub_row_group {
+#llalzxtpus .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7528,15 +7615,15 @@ fig4_il2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#hhpkwcvmrp .gt_row_group_first td {
+#llalzxtpus .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#hhpkwcvmrp .gt_row_group_first th {
+#llalzxtpus .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#hhpkwcvmrp .gt_summary_row {
+#llalzxtpus .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -7546,16 +7633,16 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hhpkwcvmrp .gt_first_summary_row {
+#llalzxtpus .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_first_summary_row.thick {
+#llalzxtpus .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#hhpkwcvmrp .gt_last_summary_row {
+#llalzxtpus .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7565,7 +7652,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_grand_summary_row {
+#llalzxtpus .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -7575,7 +7662,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hhpkwcvmrp .gt_first_grand_summary_row {
+#llalzxtpus .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7585,7 +7672,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_last_grand_summary_row_top {
+#llalzxtpus .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -7595,11 +7682,11 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_striped {
+#llalzxtpus .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#hhpkwcvmrp .gt_table_body {
+#llalzxtpus .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -7608,7 +7695,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_footnotes {
+#llalzxtpus .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -7622,7 +7709,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_footnote {
+#llalzxtpus .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -7631,7 +7718,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hhpkwcvmrp .gt_sourcenotes {
+#llalzxtpus .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -7645,7 +7732,7 @@ fig4_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hhpkwcvmrp .gt_sourcenote {
+#llalzxtpus .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -7653,63 +7740,63 @@ fig4_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hhpkwcvmrp .gt_left {
+#llalzxtpus .gt_left {
   text-align: left;
 }
 
-#hhpkwcvmrp .gt_center {
+#llalzxtpus .gt_center {
   text-align: center;
 }
 
-#hhpkwcvmrp .gt_right {
+#llalzxtpus .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#hhpkwcvmrp .gt_font_normal {
+#llalzxtpus .gt_font_normal {
   font-weight: normal;
 }
 
-#hhpkwcvmrp .gt_font_bold {
+#llalzxtpus .gt_font_bold {
   font-weight: bold;
 }
 
-#hhpkwcvmrp .gt_font_italic {
+#llalzxtpus .gt_font_italic {
   font-style: italic;
 }
 
-#hhpkwcvmrp .gt_super {
+#llalzxtpus .gt_super {
   font-size: 65%;
 }
 
-#hhpkwcvmrp .gt_footnote_marks {
+#llalzxtpus .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#hhpkwcvmrp .gt_asterisk {
+#llalzxtpus .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#hhpkwcvmrp .gt_indent_1 {
+#llalzxtpus .gt_indent_1 {
   text-indent: 5px;
 }
 
-#hhpkwcvmrp .gt_indent_2 {
+#llalzxtpus .gt_indent_2 {
   text-indent: 10px;
 }
 
-#hhpkwcvmrp .gt_indent_3 {
+#llalzxtpus .gt_indent_3 {
   text-indent: 15px;
 }
 
-#hhpkwcvmrp .gt_indent_4 {
+#llalzxtpus .gt_indent_4 {
   text-indent: 20px;
 }
 
-#hhpkwcvmrp .gt_indent_5 {
+#llalzxtpus .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -7725,64 +7812,64 @@ fig4_il2_qpcr_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">13.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1720</td>
+<td headers="P_value" class="gt_row gt_right">0.17203371</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">15.5</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0396</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">15.5</td>
+<td headers="P_value" class="gt_row gt_right">0.03960870</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs CM SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">13.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1720</td>
+<td headers="P_value" class="gt_row gt_right">0.17203371</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI SI GAPDH vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI SI GAPDH vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -7797,7 +7884,7 @@ fig4c <- fig4_il2_qpcr_result$p
 fig4c
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-87-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-88-1.png)
 
 We save the figure to a PDF file in the Figure4 directory:
 
@@ -7843,23 +7930,23 @@ fig4_stat3_protein_result$wilcox_results
 fig4_stat3_protein_result$all_wilcox_table
 ```
 
-<div id="kuhonbhviq" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#kuhonbhviq table {
+<div id="krvbpnamgt" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#krvbpnamgt table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#kuhonbhviq thead, #kuhonbhviq tbody, #kuhonbhviq tfoot, #kuhonbhviq tr, #kuhonbhviq td, #kuhonbhviq th {
+#krvbpnamgt thead, #krvbpnamgt tbody, #krvbpnamgt tfoot, #krvbpnamgt tr, #krvbpnamgt td, #krvbpnamgt th {
   border-style: none;
 }
 
-#kuhonbhviq p {
+#krvbpnamgt p {
   margin: 0;
   padding: 0;
 }
 
-#kuhonbhviq .gt_table {
+#krvbpnamgt .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -7885,12 +7972,12 @@ fig4_stat3_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_caption {
+#krvbpnamgt .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#kuhonbhviq .gt_title {
+#krvbpnamgt .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -7902,7 +7989,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#kuhonbhviq .gt_subtitle {
+#krvbpnamgt .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -7914,7 +8001,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#kuhonbhviq .gt_heading {
+#krvbpnamgt .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -7926,13 +8013,13 @@ fig4_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_bottom_border {
+#krvbpnamgt .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_col_headings {
+#krvbpnamgt .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -7947,7 +8034,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_col_heading {
+#krvbpnamgt .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7967,7 +8054,7 @@ fig4_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#kuhonbhviq .gt_column_spanner_outer {
+#krvbpnamgt .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -7979,15 +8066,15 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#kuhonbhviq .gt_column_spanner_outer:first-child {
+#krvbpnamgt .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#kuhonbhviq .gt_column_spanner_outer:last-child {
+#krvbpnamgt .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#kuhonbhviq .gt_column_spanner {
+#krvbpnamgt .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -7999,11 +8086,11 @@ fig4_stat3_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#kuhonbhviq .gt_spanner_row {
+#krvbpnamgt .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#kuhonbhviq .gt_group_heading {
+#krvbpnamgt .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8029,7 +8116,7 @@ fig4_stat3_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#kuhonbhviq .gt_empty_group_heading {
+#krvbpnamgt .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -8044,15 +8131,15 @@ fig4_stat3_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#kuhonbhviq .gt_from_md > :first-child {
+#krvbpnamgt .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#kuhonbhviq .gt_from_md > :last-child {
+#krvbpnamgt .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#kuhonbhviq .gt_row {
+#krvbpnamgt .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8071,7 +8158,7 @@ fig4_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#kuhonbhviq .gt_stub {
+#krvbpnamgt .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8084,7 +8171,7 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kuhonbhviq .gt_stub_row_group {
+#krvbpnamgt .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8098,15 +8185,15 @@ fig4_stat3_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#kuhonbhviq .gt_row_group_first td {
+#krvbpnamgt .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#kuhonbhviq .gt_row_group_first th {
+#krvbpnamgt .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#kuhonbhviq .gt_summary_row {
+#krvbpnamgt .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -8116,16 +8203,16 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kuhonbhviq .gt_first_summary_row {
+#krvbpnamgt .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_first_summary_row.thick {
+#krvbpnamgt .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#kuhonbhviq .gt_last_summary_row {
+#krvbpnamgt .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8135,7 +8222,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_grand_summary_row {
+#krvbpnamgt .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -8145,7 +8232,7 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kuhonbhviq .gt_first_grand_summary_row {
+#krvbpnamgt .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8155,7 +8242,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_last_grand_summary_row_top {
+#krvbpnamgt .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8165,11 +8252,11 @@ fig4_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_striped {
+#krvbpnamgt .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#kuhonbhviq .gt_table_body {
+#krvbpnamgt .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -8178,7 +8265,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_footnotes {
+#krvbpnamgt .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -8192,7 +8279,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_footnote {
+#krvbpnamgt .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -8201,7 +8288,7 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kuhonbhviq .gt_sourcenotes {
+#krvbpnamgt .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -8215,7 +8302,7 @@ fig4_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#kuhonbhviq .gt_sourcenote {
+#krvbpnamgt .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -8223,63 +8310,63 @@ fig4_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#kuhonbhviq .gt_left {
+#krvbpnamgt .gt_left {
   text-align: left;
 }
 
-#kuhonbhviq .gt_center {
+#krvbpnamgt .gt_center {
   text-align: center;
 }
 
-#kuhonbhviq .gt_right {
+#krvbpnamgt .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#kuhonbhviq .gt_font_normal {
+#krvbpnamgt .gt_font_normal {
   font-weight: normal;
 }
 
-#kuhonbhviq .gt_font_bold {
+#krvbpnamgt .gt_font_bold {
   font-weight: bold;
 }
 
-#kuhonbhviq .gt_font_italic {
+#krvbpnamgt .gt_font_italic {
   font-style: italic;
 }
 
-#kuhonbhviq .gt_super {
+#krvbpnamgt .gt_super {
   font-size: 65%;
 }
 
-#kuhonbhviq .gt_footnote_marks {
+#krvbpnamgt .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#kuhonbhviq .gt_asterisk {
+#krvbpnamgt .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#kuhonbhviq .gt_indent_1 {
+#krvbpnamgt .gt_indent_1 {
   text-indent: 5px;
 }
 
-#kuhonbhviq .gt_indent_2 {
+#krvbpnamgt .gt_indent_2 {
   text-indent: 10px;
 }
 
-#kuhonbhviq .gt_indent_3 {
+#krvbpnamgt .gt_indent_3 {
   text-indent: 15px;
 }
 
-#kuhonbhviq .gt_indent_4 {
+#krvbpnamgt .gt_indent_4 {
   text-indent: 20px;
 }
 
-#kuhonbhviq .gt_indent_5 {
+#krvbpnamgt .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -8295,64 +8382,64 @@ fig4_stat3_protein_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">62</td>
-<td headers="P_value" class="gt_row gt_right">0.9229</td>
+<td headers="P_value" class="gt_row gt_right">9.228697e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">77</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0433</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">15</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0266</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">12</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0057</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">77</td>
+<td headers="P_value" class="gt_row gt_right">4.325705e-02</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">15</td>
+<td headers="P_value" class="gt_row gt_right">2.664656e-02</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">5.672346e-03</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">66</td>
-<td headers="P_value" class="gt_row gt_right">0.7223</td>
+<td headers="P_value" class="gt_row gt_right">7.223427e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs CM SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">83</td>
-<td headers="P_value" class="gt_row gt_right">0.1402</td>
+<td headers="P_value" class="gt_row gt_right">1.402375e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">22</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0473</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI GAPDH vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0056</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">22</td>
+<td headers="P_value" class="gt_row gt_right">4.734461e-02</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">5.620386e-03</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">78</td>
-<td headers="P_value" class="gt_row gt_right">0.7553</td>
+<td headers="P_value" class="gt_row gt_right">7.552848e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0000</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0000</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">4.570593e-05</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">2.165018e-05</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">40</td>
-<td headers="P_value" class="gt_row gt_right">0.2030</td>
+<td headers="P_value" class="gt_row gt_right">2.029673e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">21</td>
-<td headers="P_value" class="gt_row gt_right">0.1672</td>
+<td headers="P_value" class="gt_row gt_right">1.671740e-01</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">80</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0124</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI SI GAPDH vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">95</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0024</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">80</td>
+<td headers="P_value" class="gt_row gt_right">1.239978e-02</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI SI GAPDH vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">95</td>
+<td headers="P_value" class="gt_row gt_right">2.435954e-03</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -8367,7 +8454,7 @@ fig4d <- fig4_stat3_protein_result$p
 fig4d
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-94-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-95-1.png)
 
 We save the figure to a PDF file in the Figure4 directory:
 
@@ -8410,23 +8497,23 @@ fig4_ets2_protein_result$wilcox_results
 fig4_ets2_protein_result$all_wilcox_table
 ```
 
-<div id="aepbyguqjp" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#aepbyguqjp table {
+<div id="jocdjvhzjk" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#jocdjvhzjk table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#aepbyguqjp thead, #aepbyguqjp tbody, #aepbyguqjp tfoot, #aepbyguqjp tr, #aepbyguqjp td, #aepbyguqjp th {
+#jocdjvhzjk thead, #jocdjvhzjk tbody, #jocdjvhzjk tfoot, #jocdjvhzjk tr, #jocdjvhzjk td, #jocdjvhzjk th {
   border-style: none;
 }
 
-#aepbyguqjp p {
+#jocdjvhzjk p {
   margin: 0;
   padding: 0;
 }
 
-#aepbyguqjp .gt_table {
+#jocdjvhzjk .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -8452,12 +8539,12 @@ fig4_ets2_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_caption {
+#jocdjvhzjk .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#aepbyguqjp .gt_title {
+#jocdjvhzjk .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -8469,7 +8556,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#aepbyguqjp .gt_subtitle {
+#jocdjvhzjk .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -8481,7 +8568,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#aepbyguqjp .gt_heading {
+#jocdjvhzjk .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -8493,13 +8580,13 @@ fig4_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_bottom_border {
+#jocdjvhzjk .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_col_headings {
+#jocdjvhzjk .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -8514,7 +8601,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_col_heading {
+#jocdjvhzjk .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8534,7 +8621,7 @@ fig4_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#aepbyguqjp .gt_column_spanner_outer {
+#jocdjvhzjk .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8546,15 +8633,15 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#aepbyguqjp .gt_column_spanner_outer:first-child {
+#jocdjvhzjk .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#aepbyguqjp .gt_column_spanner_outer:last-child {
+#jocdjvhzjk .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#aepbyguqjp .gt_column_spanner {
+#jocdjvhzjk .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -8566,11 +8653,11 @@ fig4_ets2_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#aepbyguqjp .gt_spanner_row {
+#jocdjvhzjk .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#aepbyguqjp .gt_group_heading {
+#jocdjvhzjk .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8596,7 +8683,7 @@ fig4_ets2_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#aepbyguqjp .gt_empty_group_heading {
+#jocdjvhzjk .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -8611,15 +8698,15 @@ fig4_ets2_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#aepbyguqjp .gt_from_md > :first-child {
+#jocdjvhzjk .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#aepbyguqjp .gt_from_md > :last-child {
+#jocdjvhzjk .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#aepbyguqjp .gt_row {
+#jocdjvhzjk .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8638,7 +8725,7 @@ fig4_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#aepbyguqjp .gt_stub {
+#jocdjvhzjk .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8651,7 +8738,7 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aepbyguqjp .gt_stub_row_group {
+#jocdjvhzjk .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -8665,15 +8752,15 @@ fig4_ets2_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#aepbyguqjp .gt_row_group_first td {
+#jocdjvhzjk .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#aepbyguqjp .gt_row_group_first th {
+#jocdjvhzjk .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#aepbyguqjp .gt_summary_row {
+#jocdjvhzjk .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -8683,16 +8770,16 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aepbyguqjp .gt_first_summary_row {
+#jocdjvhzjk .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_first_summary_row.thick {
+#jocdjvhzjk .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#aepbyguqjp .gt_last_summary_row {
+#jocdjvhzjk .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8702,7 +8789,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_grand_summary_row {
+#jocdjvhzjk .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -8712,7 +8799,7 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aepbyguqjp .gt_first_grand_summary_row {
+#jocdjvhzjk .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8722,7 +8809,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_last_grand_summary_row_top {
+#jocdjvhzjk .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -8732,11 +8819,11 @@ fig4_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_striped {
+#jocdjvhzjk .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#aepbyguqjp .gt_table_body {
+#jocdjvhzjk .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -8745,7 +8832,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_footnotes {
+#jocdjvhzjk .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -8759,7 +8846,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_footnote {
+#jocdjvhzjk .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -8768,7 +8855,7 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aepbyguqjp .gt_sourcenotes {
+#jocdjvhzjk .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -8782,7 +8869,7 @@ fig4_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#aepbyguqjp .gt_sourcenote {
+#jocdjvhzjk .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -8790,63 +8877,63 @@ fig4_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#aepbyguqjp .gt_left {
+#jocdjvhzjk .gt_left {
   text-align: left;
 }
 
-#aepbyguqjp .gt_center {
+#jocdjvhzjk .gt_center {
   text-align: center;
 }
 
-#aepbyguqjp .gt_right {
+#jocdjvhzjk .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#aepbyguqjp .gt_font_normal {
+#jocdjvhzjk .gt_font_normal {
   font-weight: normal;
 }
 
-#aepbyguqjp .gt_font_bold {
+#jocdjvhzjk .gt_font_bold {
   font-weight: bold;
 }
 
-#aepbyguqjp .gt_font_italic {
+#jocdjvhzjk .gt_font_italic {
   font-style: italic;
 }
 
-#aepbyguqjp .gt_super {
+#jocdjvhzjk .gt_super {
   font-size: 65%;
 }
 
-#aepbyguqjp .gt_footnote_marks {
+#jocdjvhzjk .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#aepbyguqjp .gt_asterisk {
+#jocdjvhzjk .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#aepbyguqjp .gt_indent_1 {
+#jocdjvhzjk .gt_indent_1 {
   text-indent: 5px;
 }
 
-#aepbyguqjp .gt_indent_2 {
+#jocdjvhzjk .gt_indent_2 {
   text-indent: 10px;
 }
 
-#aepbyguqjp .gt_indent_3 {
+#jocdjvhzjk .gt_indent_3 {
   text-indent: 15px;
 }
 
-#aepbyguqjp .gt_indent_4 {
+#jocdjvhzjk .gt_indent_4 {
   text-indent: 20px;
 }
 
-#aepbyguqjp .gt_indent_5 {
+#jocdjvhzjk .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -8862,63 +8949,63 @@ fig4_ets2_protein_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">15</td>
-<td headers="P_value" class="gt_row gt_right">0.6991</td>
+<td headers="P_value" class="gt_row gt_right">0.699134199</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">2</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0087</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">31</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0411</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">2</td>
+<td headers="P_value" class="gt_row gt_right">0.008658009</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">31</td>
+<td headers="P_value" class="gt_row gt_right">0.041125541</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.3290</td>
+<td headers="P_value" class="gt_row gt_right">0.329004329</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">3</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0152</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">3</td>
+<td headers="P_value" class="gt_row gt_right">0.015151515</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs CM SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">30</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.6623</td>
+<td headers="P_value" class="gt_row gt_right">0.662337662</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI GAPDH vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.0649</td>
+<td headers="P_value" class="gt_row gt_right">0.064935065</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM SI STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">36</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">36</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI GAPDH</td>
 <td headers="Statistic" class="gt_row gt_right">26</td>
-<td headers="P_value" class="gt_row gt_right">0.0519</td>
+<td headers="P_value" class="gt_row gt_right">0.051948052</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM SI STAT3 vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">15</td>
-<td headers="P_value" class="gt_row gt_right">0.6991</td>
+<td headers="P_value" class="gt_row gt_right">0.699134199</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI SI GAPDH</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0043</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI SI STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI GAPDH</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.004329004</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI SI STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI SI GAPDH vs PI SI STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.1255</td>
+<td headers="P_value" class="gt_row gt_right">0.125541126</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -8934,7 +9021,7 @@ fig4e <- fig4_ets2_protein_result$p
 fig4e
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-101-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-102-1.png)
 
 We create the composite Figure 4:
 
@@ -8950,7 +9037,7 @@ composite_fig4 <- plot_grid(fig4a, fig4d, fig4b, fig4e, fig4c, fig4c,
 composite_fig4
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-103-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-104-1.png)
 
 ``` r
 ggsave("output/Figure4/composite_fig4.pdf", composite_fig4, 
@@ -8999,23 +9086,23 @@ We check the results of all the statistical tests:
 fig5_il6_promoter_stat3_result$all_wilcox_table
 ```
 
-<div id="bngnjphxar" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#bngnjphxar table {
+<div id="hpmdiuxgzl" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#hpmdiuxgzl table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#bngnjphxar thead, #bngnjphxar tbody, #bngnjphxar tfoot, #bngnjphxar tr, #bngnjphxar td, #bngnjphxar th {
+#hpmdiuxgzl thead, #hpmdiuxgzl tbody, #hpmdiuxgzl tfoot, #hpmdiuxgzl tr, #hpmdiuxgzl td, #hpmdiuxgzl th {
   border-style: none;
 }
 
-#bngnjphxar p {
+#hpmdiuxgzl p {
   margin: 0;
   padding: 0;
 }
 
-#bngnjphxar .gt_table {
+#hpmdiuxgzl .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -9041,12 +9128,12 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_caption {
+#hpmdiuxgzl .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#bngnjphxar .gt_title {
+#hpmdiuxgzl .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -9058,7 +9145,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#bngnjphxar .gt_subtitle {
+#hpmdiuxgzl .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -9070,7 +9157,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#bngnjphxar .gt_heading {
+#hpmdiuxgzl .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -9082,13 +9169,13 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_bottom_border {
+#hpmdiuxgzl .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_col_headings {
+#hpmdiuxgzl .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -9103,7 +9190,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_col_heading {
+#hpmdiuxgzl .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9123,7 +9210,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#bngnjphxar .gt_column_spanner_outer {
+#hpmdiuxgzl .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9135,15 +9222,15 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#bngnjphxar .gt_column_spanner_outer:first-child {
+#hpmdiuxgzl .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#bngnjphxar .gt_column_spanner_outer:last-child {
+#hpmdiuxgzl .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#bngnjphxar .gt_column_spanner {
+#hpmdiuxgzl .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -9155,11 +9242,11 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   width: 100%;
 }
 
-#bngnjphxar .gt_spanner_row {
+#hpmdiuxgzl .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#bngnjphxar .gt_group_heading {
+#hpmdiuxgzl .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9185,7 +9272,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   text-align: left;
 }
 
-#bngnjphxar .gt_empty_group_heading {
+#hpmdiuxgzl .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -9200,15 +9287,15 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#bngnjphxar .gt_from_md > :first-child {
+#hpmdiuxgzl .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#bngnjphxar .gt_from_md > :last-child {
+#hpmdiuxgzl .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#bngnjphxar .gt_row {
+#hpmdiuxgzl .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9227,7 +9314,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#bngnjphxar .gt_stub {
+#hpmdiuxgzl .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9240,7 +9327,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bngnjphxar .gt_stub_row_group {
+#hpmdiuxgzl .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9254,15 +9341,15 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#bngnjphxar .gt_row_group_first td {
+#hpmdiuxgzl .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#bngnjphxar .gt_row_group_first th {
+#hpmdiuxgzl .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#bngnjphxar .gt_summary_row {
+#hpmdiuxgzl .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -9272,16 +9359,16 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bngnjphxar .gt_first_summary_row {
+#hpmdiuxgzl .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_first_summary_row.thick {
+#hpmdiuxgzl .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#bngnjphxar .gt_last_summary_row {
+#hpmdiuxgzl .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9291,7 +9378,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_grand_summary_row {
+#hpmdiuxgzl .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -9301,7 +9388,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bngnjphxar .gt_first_grand_summary_row {
+#hpmdiuxgzl .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9311,7 +9398,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_last_grand_summary_row_top {
+#hpmdiuxgzl .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9321,11 +9408,11 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_striped {
+#hpmdiuxgzl .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#bngnjphxar .gt_table_body {
+#hpmdiuxgzl .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -9334,7 +9421,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_footnotes {
+#hpmdiuxgzl .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -9348,7 +9435,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_footnote {
+#hpmdiuxgzl .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -9357,7 +9444,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bngnjphxar .gt_sourcenotes {
+#hpmdiuxgzl .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -9371,7 +9458,7 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bngnjphxar .gt_sourcenote {
+#hpmdiuxgzl .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -9379,63 +9466,63 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bngnjphxar .gt_left {
+#hpmdiuxgzl .gt_left {
   text-align: left;
 }
 
-#bngnjphxar .gt_center {
+#hpmdiuxgzl .gt_center {
   text-align: center;
 }
 
-#bngnjphxar .gt_right {
+#hpmdiuxgzl .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#bngnjphxar .gt_font_normal {
+#hpmdiuxgzl .gt_font_normal {
   font-weight: normal;
 }
 
-#bngnjphxar .gt_font_bold {
+#hpmdiuxgzl .gt_font_bold {
   font-weight: bold;
 }
 
-#bngnjphxar .gt_font_italic {
+#hpmdiuxgzl .gt_font_italic {
   font-style: italic;
 }
 
-#bngnjphxar .gt_super {
+#hpmdiuxgzl .gt_super {
   font-size: 65%;
 }
 
-#bngnjphxar .gt_footnote_marks {
+#hpmdiuxgzl .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#bngnjphxar .gt_asterisk {
+#hpmdiuxgzl .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#bngnjphxar .gt_indent_1 {
+#hpmdiuxgzl .gt_indent_1 {
   text-indent: 5px;
 }
 
-#bngnjphxar .gt_indent_2 {
+#hpmdiuxgzl .gt_indent_2 {
   text-indent: 10px;
 }
 
-#bngnjphxar .gt_indent_3 {
+#hpmdiuxgzl .gt_indent_3 {
   text-indent: 15px;
 }
 
-#bngnjphxar .gt_indent_4 {
+#hpmdiuxgzl .gt_indent_4 {
   text-indent: 20px;
 }
 
-#bngnjphxar .gt_indent_5 {
+#hpmdiuxgzl .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -9449,30 +9536,30 @@ fig5_il6_promoter_stat3_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3 vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -9489,7 +9576,7 @@ fig5g <- fig5_il6_promoter_stat3_result$p
 fig5g
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-110-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-111-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -9534,23 +9621,23 @@ fig5_il6_promoter_pstat3_result$wilcox_results
 fig5_il6_promoter_pstat3_result$all_wilcox_table
 ```
 
-<div id="urmzqndvrl" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#urmzqndvrl table {
+<div id="mvoephofuy" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#mvoephofuy table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#urmzqndvrl thead, #urmzqndvrl tbody, #urmzqndvrl tfoot, #urmzqndvrl tr, #urmzqndvrl td, #urmzqndvrl th {
+#mvoephofuy thead, #mvoephofuy tbody, #mvoephofuy tfoot, #mvoephofuy tr, #mvoephofuy td, #mvoephofuy th {
   border-style: none;
 }
 
-#urmzqndvrl p {
+#mvoephofuy p {
   margin: 0;
   padding: 0;
 }
 
-#urmzqndvrl .gt_table {
+#mvoephofuy .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -9576,12 +9663,12 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_caption {
+#mvoephofuy .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#urmzqndvrl .gt_title {
+#mvoephofuy .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -9593,7 +9680,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#urmzqndvrl .gt_subtitle {
+#mvoephofuy .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -9605,7 +9692,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#urmzqndvrl .gt_heading {
+#mvoephofuy .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -9617,13 +9704,13 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_bottom_border {
+#mvoephofuy .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_col_headings {
+#mvoephofuy .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -9638,7 +9725,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_col_heading {
+#mvoephofuy .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9658,7 +9745,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#urmzqndvrl .gt_column_spanner_outer {
+#mvoephofuy .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9670,15 +9757,15 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#urmzqndvrl .gt_column_spanner_outer:first-child {
+#mvoephofuy .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#urmzqndvrl .gt_column_spanner_outer:last-child {
+#mvoephofuy .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#urmzqndvrl .gt_column_spanner {
+#mvoephofuy .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -9690,11 +9777,11 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   width: 100%;
 }
 
-#urmzqndvrl .gt_spanner_row {
+#mvoephofuy .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#urmzqndvrl .gt_group_heading {
+#mvoephofuy .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9720,7 +9807,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   text-align: left;
 }
 
-#urmzqndvrl .gt_empty_group_heading {
+#mvoephofuy .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -9735,15 +9822,15 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#urmzqndvrl .gt_from_md > :first-child {
+#mvoephofuy .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#urmzqndvrl .gt_from_md > :last-child {
+#mvoephofuy .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#urmzqndvrl .gt_row {
+#mvoephofuy .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9762,7 +9849,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#urmzqndvrl .gt_stub {
+#mvoephofuy .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9775,7 +9862,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#urmzqndvrl .gt_stub_row_group {
+#mvoephofuy .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -9789,15 +9876,15 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#urmzqndvrl .gt_row_group_first td {
+#mvoephofuy .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#urmzqndvrl .gt_row_group_first th {
+#mvoephofuy .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#urmzqndvrl .gt_summary_row {
+#mvoephofuy .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -9807,16 +9894,16 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#urmzqndvrl .gt_first_summary_row {
+#mvoephofuy .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_first_summary_row.thick {
+#mvoephofuy .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#urmzqndvrl .gt_last_summary_row {
+#mvoephofuy .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9826,7 +9913,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_grand_summary_row {
+#mvoephofuy .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -9836,7 +9923,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#urmzqndvrl .gt_first_grand_summary_row {
+#mvoephofuy .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9846,7 +9933,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_last_grand_summary_row_top {
+#mvoephofuy .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -9856,11 +9943,11 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_striped {
+#mvoephofuy .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#urmzqndvrl .gt_table_body {
+#mvoephofuy .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -9869,7 +9956,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_footnotes {
+#mvoephofuy .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -9883,7 +9970,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_footnote {
+#mvoephofuy .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -9892,7 +9979,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#urmzqndvrl .gt_sourcenotes {
+#mvoephofuy .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -9906,7 +9993,7 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#urmzqndvrl .gt_sourcenote {
+#mvoephofuy .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -9914,63 +10001,63 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#urmzqndvrl .gt_left {
+#mvoephofuy .gt_left {
   text-align: left;
 }
 
-#urmzqndvrl .gt_center {
+#mvoephofuy .gt_center {
   text-align: center;
 }
 
-#urmzqndvrl .gt_right {
+#mvoephofuy .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#urmzqndvrl .gt_font_normal {
+#mvoephofuy .gt_font_normal {
   font-weight: normal;
 }
 
-#urmzqndvrl .gt_font_bold {
+#mvoephofuy .gt_font_bold {
   font-weight: bold;
 }
 
-#urmzqndvrl .gt_font_italic {
+#mvoephofuy .gt_font_italic {
   font-style: italic;
 }
 
-#urmzqndvrl .gt_super {
+#mvoephofuy .gt_super {
   font-size: 65%;
 }
 
-#urmzqndvrl .gt_footnote_marks {
+#mvoephofuy .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#urmzqndvrl .gt_asterisk {
+#mvoephofuy .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#urmzqndvrl .gt_indent_1 {
+#mvoephofuy .gt_indent_1 {
   text-indent: 5px;
 }
 
-#urmzqndvrl .gt_indent_2 {
+#mvoephofuy .gt_indent_2 {
   text-indent: 10px;
 }
 
-#urmzqndvrl .gt_indent_3 {
+#mvoephofuy .gt_indent_3 {
   text-indent: 15px;
 }
 
-#urmzqndvrl .gt_indent_4 {
+#mvoephofuy .gt_indent_4 {
   text-indent: 20px;
 }
 
-#urmzqndvrl .gt_indent_5 {
+#mvoephofuy .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -9986,28 +10073,28 @@ fig5_il6_promoter_pstat3_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -10024,7 +10111,7 @@ fig5h <- fig5_il6_promoter_pstat3_result$p
 fig5h
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-117-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-118-1.png)
 
 We save the figure to a PDF file in the Figure5 directory:
 
@@ -10059,23 +10146,23 @@ We check the results of the statistical tests:
 fig5_actin_promoter_stat3_result$all_wilcox_table
 ```
 
-<div id="xlpwjcrkyl" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#xlpwjcrkyl table {
+<div id="ptmusuvtaq" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#ptmusuvtaq table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#xlpwjcrkyl thead, #xlpwjcrkyl tbody, #xlpwjcrkyl tfoot, #xlpwjcrkyl tr, #xlpwjcrkyl td, #xlpwjcrkyl th {
+#ptmusuvtaq thead, #ptmusuvtaq tbody, #ptmusuvtaq tfoot, #ptmusuvtaq tr, #ptmusuvtaq td, #ptmusuvtaq th {
   border-style: none;
 }
 
-#xlpwjcrkyl p {
+#ptmusuvtaq p {
   margin: 0;
   padding: 0;
 }
 
-#xlpwjcrkyl .gt_table {
+#ptmusuvtaq .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -10101,12 +10188,12 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_caption {
+#ptmusuvtaq .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#xlpwjcrkyl .gt_title {
+#ptmusuvtaq .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -10118,7 +10205,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#xlpwjcrkyl .gt_subtitle {
+#ptmusuvtaq .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -10130,7 +10217,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#xlpwjcrkyl .gt_heading {
+#ptmusuvtaq .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -10142,13 +10229,13 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_bottom_border {
+#ptmusuvtaq .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_col_headings {
+#ptmusuvtaq .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -10163,7 +10250,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_col_heading {
+#ptmusuvtaq .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10183,7 +10270,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xlpwjcrkyl .gt_column_spanner_outer {
+#ptmusuvtaq .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10195,15 +10282,15 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#xlpwjcrkyl .gt_column_spanner_outer:first-child {
+#ptmusuvtaq .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#xlpwjcrkyl .gt_column_spanner_outer:last-child {
+#ptmusuvtaq .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#xlpwjcrkyl .gt_column_spanner {
+#ptmusuvtaq .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -10215,11 +10302,11 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   width: 100%;
 }
 
-#xlpwjcrkyl .gt_spanner_row {
+#ptmusuvtaq .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#xlpwjcrkyl .gt_group_heading {
+#ptmusuvtaq .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10245,7 +10332,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   text-align: left;
 }
 
-#xlpwjcrkyl .gt_empty_group_heading {
+#ptmusuvtaq .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -10260,15 +10347,15 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#xlpwjcrkyl .gt_from_md > :first-child {
+#ptmusuvtaq .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#xlpwjcrkyl .gt_from_md > :last-child {
+#ptmusuvtaq .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#xlpwjcrkyl .gt_row {
+#ptmusuvtaq .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10287,7 +10374,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xlpwjcrkyl .gt_stub {
+#ptmusuvtaq .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10300,7 +10387,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xlpwjcrkyl .gt_stub_row_group {
+#ptmusuvtaq .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10314,15 +10401,15 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#xlpwjcrkyl .gt_row_group_first td {
+#ptmusuvtaq .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#xlpwjcrkyl .gt_row_group_first th {
+#ptmusuvtaq .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#xlpwjcrkyl .gt_summary_row {
+#ptmusuvtaq .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -10332,16 +10419,16 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xlpwjcrkyl .gt_first_summary_row {
+#ptmusuvtaq .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_first_summary_row.thick {
+#ptmusuvtaq .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#xlpwjcrkyl .gt_last_summary_row {
+#ptmusuvtaq .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10351,7 +10438,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_grand_summary_row {
+#ptmusuvtaq .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -10361,7 +10448,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xlpwjcrkyl .gt_first_grand_summary_row {
+#ptmusuvtaq .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10371,7 +10458,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_last_grand_summary_row_top {
+#ptmusuvtaq .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10381,11 +10468,11 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_striped {
+#ptmusuvtaq .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#xlpwjcrkyl .gt_table_body {
+#ptmusuvtaq .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -10394,7 +10481,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_footnotes {
+#ptmusuvtaq .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -10408,7 +10495,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_footnote {
+#ptmusuvtaq .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -10417,7 +10504,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xlpwjcrkyl .gt_sourcenotes {
+#ptmusuvtaq .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -10431,7 +10518,7 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xlpwjcrkyl .gt_sourcenote {
+#ptmusuvtaq .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -10439,63 +10526,63 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xlpwjcrkyl .gt_left {
+#ptmusuvtaq .gt_left {
   text-align: left;
 }
 
-#xlpwjcrkyl .gt_center {
+#ptmusuvtaq .gt_center {
   text-align: center;
 }
 
-#xlpwjcrkyl .gt_right {
+#ptmusuvtaq .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#xlpwjcrkyl .gt_font_normal {
+#ptmusuvtaq .gt_font_normal {
   font-weight: normal;
 }
 
-#xlpwjcrkyl .gt_font_bold {
+#ptmusuvtaq .gt_font_bold {
   font-weight: bold;
 }
 
-#xlpwjcrkyl .gt_font_italic {
+#ptmusuvtaq .gt_font_italic {
   font-style: italic;
 }
 
-#xlpwjcrkyl .gt_super {
+#ptmusuvtaq .gt_super {
   font-size: 65%;
 }
 
-#xlpwjcrkyl .gt_footnote_marks {
+#ptmusuvtaq .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#xlpwjcrkyl .gt_asterisk {
+#ptmusuvtaq .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#xlpwjcrkyl .gt_indent_1 {
+#ptmusuvtaq .gt_indent_1 {
   text-indent: 5px;
 }
 
-#xlpwjcrkyl .gt_indent_2 {
+#ptmusuvtaq .gt_indent_2 {
   text-indent: 10px;
 }
 
-#xlpwjcrkyl .gt_indent_3 {
+#ptmusuvtaq .gt_indent_3 {
   text-indent: 15px;
 }
 
-#xlpwjcrkyl .gt_indent_4 {
+#ptmusuvtaq .gt_indent_4 {
   text-indent: 20px;
 }
 
-#xlpwjcrkyl .gt_indent_5 {
+#ptmusuvtaq .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -10509,30 +10596,30 @@ fig5_actin_promoter_stat3_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3 vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -10549,7 +10636,7 @@ fig5i <- fig5_actin_promoter_stat3_result$p
 fig5i
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-123-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-124-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -10582,23 +10669,23 @@ We check the results of the statistical tests:
 fig5_actin_promoter_pstat3_result$all_wilcox_table
 ```
 
-<div id="hivvkhfrtd" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#hivvkhfrtd table {
+<div id="hapnozqwuy" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#hapnozqwuy table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#hivvkhfrtd thead, #hivvkhfrtd tbody, #hivvkhfrtd tfoot, #hivvkhfrtd tr, #hivvkhfrtd td, #hivvkhfrtd th {
+#hapnozqwuy thead, #hapnozqwuy tbody, #hapnozqwuy tfoot, #hapnozqwuy tr, #hapnozqwuy td, #hapnozqwuy th {
   border-style: none;
 }
 
-#hivvkhfrtd p {
+#hapnozqwuy p {
   margin: 0;
   padding: 0;
 }
 
-#hivvkhfrtd .gt_table {
+#hapnozqwuy .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -10624,12 +10711,12 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_caption {
+#hapnozqwuy .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#hivvkhfrtd .gt_title {
+#hapnozqwuy .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -10641,7 +10728,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#hivvkhfrtd .gt_subtitle {
+#hapnozqwuy .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -10653,7 +10740,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#hivvkhfrtd .gt_heading {
+#hapnozqwuy .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -10665,13 +10752,13 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_bottom_border {
+#hapnozqwuy .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_col_headings {
+#hapnozqwuy .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -10686,7 +10773,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_col_heading {
+#hapnozqwuy .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10706,7 +10793,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#hivvkhfrtd .gt_column_spanner_outer {
+#hapnozqwuy .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10718,15 +10805,15 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#hivvkhfrtd .gt_column_spanner_outer:first-child {
+#hapnozqwuy .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#hivvkhfrtd .gt_column_spanner_outer:last-child {
+#hapnozqwuy .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#hivvkhfrtd .gt_column_spanner {
+#hapnozqwuy .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -10738,11 +10825,11 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   width: 100%;
 }
 
-#hivvkhfrtd .gt_spanner_row {
+#hapnozqwuy .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#hivvkhfrtd .gt_group_heading {
+#hapnozqwuy .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10768,7 +10855,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   text-align: left;
 }
 
-#hivvkhfrtd .gt_empty_group_heading {
+#hapnozqwuy .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -10783,15 +10870,15 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#hivvkhfrtd .gt_from_md > :first-child {
+#hapnozqwuy .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#hivvkhfrtd .gt_from_md > :last-child {
+#hapnozqwuy .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#hivvkhfrtd .gt_row {
+#hapnozqwuy .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10810,7 +10897,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#hivvkhfrtd .gt_stub {
+#hapnozqwuy .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10823,7 +10910,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hivvkhfrtd .gt_stub_row_group {
+#hapnozqwuy .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -10837,15 +10924,15 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#hivvkhfrtd .gt_row_group_first td {
+#hapnozqwuy .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#hivvkhfrtd .gt_row_group_first th {
+#hapnozqwuy .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#hivvkhfrtd .gt_summary_row {
+#hapnozqwuy .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -10855,16 +10942,16 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hivvkhfrtd .gt_first_summary_row {
+#hapnozqwuy .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_first_summary_row.thick {
+#hapnozqwuy .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#hivvkhfrtd .gt_last_summary_row {
+#hapnozqwuy .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10874,7 +10961,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_grand_summary_row {
+#hapnozqwuy .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -10884,7 +10971,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hivvkhfrtd .gt_first_grand_summary_row {
+#hapnozqwuy .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10894,7 +10981,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_last_grand_summary_row_top {
+#hapnozqwuy .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -10904,11 +10991,11 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_striped {
+#hapnozqwuy .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#hivvkhfrtd .gt_table_body {
+#hapnozqwuy .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -10917,7 +11004,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_footnotes {
+#hapnozqwuy .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -10931,7 +11018,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_footnote {
+#hapnozqwuy .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -10940,7 +11027,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hivvkhfrtd .gt_sourcenotes {
+#hapnozqwuy .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -10954,7 +11041,7 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#hivvkhfrtd .gt_sourcenote {
+#hapnozqwuy .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -10962,63 +11049,63 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#hivvkhfrtd .gt_left {
+#hapnozqwuy .gt_left {
   text-align: left;
 }
 
-#hivvkhfrtd .gt_center {
+#hapnozqwuy .gt_center {
   text-align: center;
 }
 
-#hivvkhfrtd .gt_right {
+#hapnozqwuy .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#hivvkhfrtd .gt_font_normal {
+#hapnozqwuy .gt_font_normal {
   font-weight: normal;
 }
 
-#hivvkhfrtd .gt_font_bold {
+#hapnozqwuy .gt_font_bold {
   font-weight: bold;
 }
 
-#hivvkhfrtd .gt_font_italic {
+#hapnozqwuy .gt_font_italic {
   font-style: italic;
 }
 
-#hivvkhfrtd .gt_super {
+#hapnozqwuy .gt_super {
   font-size: 65%;
 }
 
-#hivvkhfrtd .gt_footnote_marks {
+#hapnozqwuy .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#hivvkhfrtd .gt_asterisk {
+#hapnozqwuy .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#hivvkhfrtd .gt_indent_1 {
+#hapnozqwuy .gt_indent_1 {
   text-indent: 5px;
 }
 
-#hivvkhfrtd .gt_indent_2 {
+#hapnozqwuy .gt_indent_2 {
   text-indent: 10px;
 }
 
-#hivvkhfrtd .gt_indent_3 {
+#hapnozqwuy .gt_indent_3 {
   text-indent: 15px;
 }
 
-#hivvkhfrtd .gt_indent_4 {
+#hapnozqwuy .gt_indent_4 {
   text-indent: 20px;
 }
 
-#hivvkhfrtd .gt_indent_5 {
+#hapnozqwuy .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -11032,30 +11119,30 @@ fig5_actin_promoter_pstat3_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -11072,7 +11159,7 @@ fig5j <- fig5_actin_promoter_pstat3_result$p
 fig5j
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-129-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-130-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -11105,23 +11192,23 @@ We check the results of the statistical tests:
 fig5_gas1_stat3_result$all_wilcox_table
 ```
 
-<div id="vgaplxkmsx" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#vgaplxkmsx table {
+<div id="uovhrulgbm" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#uovhrulgbm table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#vgaplxkmsx thead, #vgaplxkmsx tbody, #vgaplxkmsx tfoot, #vgaplxkmsx tr, #vgaplxkmsx td, #vgaplxkmsx th {
+#uovhrulgbm thead, #uovhrulgbm tbody, #uovhrulgbm tfoot, #uovhrulgbm tr, #uovhrulgbm td, #uovhrulgbm th {
   border-style: none;
 }
 
-#vgaplxkmsx p {
+#uovhrulgbm p {
   margin: 0;
   padding: 0;
 }
 
-#vgaplxkmsx .gt_table {
+#uovhrulgbm .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -11147,12 +11234,12 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_caption {
+#uovhrulgbm .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#vgaplxkmsx .gt_title {
+#uovhrulgbm .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -11164,7 +11251,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#vgaplxkmsx .gt_subtitle {
+#uovhrulgbm .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -11176,7 +11263,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#vgaplxkmsx .gt_heading {
+#uovhrulgbm .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -11188,13 +11275,13 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_bottom_border {
+#uovhrulgbm .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_col_headings {
+#uovhrulgbm .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -11209,7 +11296,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_col_heading {
+#uovhrulgbm .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11229,7 +11316,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vgaplxkmsx .gt_column_spanner_outer {
+#uovhrulgbm .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11241,15 +11328,15 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#vgaplxkmsx .gt_column_spanner_outer:first-child {
+#uovhrulgbm .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#vgaplxkmsx .gt_column_spanner_outer:last-child {
+#uovhrulgbm .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#vgaplxkmsx .gt_column_spanner {
+#uovhrulgbm .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -11261,11 +11348,11 @@ fig5_gas1_stat3_result$all_wilcox_table
   width: 100%;
 }
 
-#vgaplxkmsx .gt_spanner_row {
+#uovhrulgbm .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#vgaplxkmsx .gt_group_heading {
+#uovhrulgbm .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11291,7 +11378,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   text-align: left;
 }
 
-#vgaplxkmsx .gt_empty_group_heading {
+#uovhrulgbm .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -11306,15 +11393,15 @@ fig5_gas1_stat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#vgaplxkmsx .gt_from_md > :first-child {
+#uovhrulgbm .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#vgaplxkmsx .gt_from_md > :last-child {
+#uovhrulgbm .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#vgaplxkmsx .gt_row {
+#uovhrulgbm .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11333,7 +11420,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vgaplxkmsx .gt_stub {
+#uovhrulgbm .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11346,7 +11433,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vgaplxkmsx .gt_stub_row_group {
+#uovhrulgbm .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11360,15 +11447,15 @@ fig5_gas1_stat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#vgaplxkmsx .gt_row_group_first td {
+#uovhrulgbm .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#vgaplxkmsx .gt_row_group_first th {
+#uovhrulgbm .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#vgaplxkmsx .gt_summary_row {
+#uovhrulgbm .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -11378,16 +11465,16 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vgaplxkmsx .gt_first_summary_row {
+#uovhrulgbm .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_first_summary_row.thick {
+#uovhrulgbm .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#vgaplxkmsx .gt_last_summary_row {
+#uovhrulgbm .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11397,7 +11484,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_grand_summary_row {
+#uovhrulgbm .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -11407,7 +11494,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vgaplxkmsx .gt_first_grand_summary_row {
+#uovhrulgbm .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11417,7 +11504,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_last_grand_summary_row_top {
+#uovhrulgbm .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11427,11 +11514,11 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_striped {
+#uovhrulgbm .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#vgaplxkmsx .gt_table_body {
+#uovhrulgbm .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -11440,7 +11527,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_footnotes {
+#uovhrulgbm .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -11454,7 +11541,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_footnote {
+#uovhrulgbm .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -11463,7 +11550,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vgaplxkmsx .gt_sourcenotes {
+#uovhrulgbm .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -11477,7 +11564,7 @@ fig5_gas1_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vgaplxkmsx .gt_sourcenote {
+#uovhrulgbm .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -11485,63 +11572,63 @@ fig5_gas1_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vgaplxkmsx .gt_left {
+#uovhrulgbm .gt_left {
   text-align: left;
 }
 
-#vgaplxkmsx .gt_center {
+#uovhrulgbm .gt_center {
   text-align: center;
 }
 
-#vgaplxkmsx .gt_right {
+#uovhrulgbm .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#vgaplxkmsx .gt_font_normal {
+#uovhrulgbm .gt_font_normal {
   font-weight: normal;
 }
 
-#vgaplxkmsx .gt_font_bold {
+#uovhrulgbm .gt_font_bold {
   font-weight: bold;
 }
 
-#vgaplxkmsx .gt_font_italic {
+#uovhrulgbm .gt_font_italic {
   font-style: italic;
 }
 
-#vgaplxkmsx .gt_super {
+#uovhrulgbm .gt_super {
   font-size: 65%;
 }
 
-#vgaplxkmsx .gt_footnote_marks {
+#uovhrulgbm .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#vgaplxkmsx .gt_asterisk {
+#uovhrulgbm .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#vgaplxkmsx .gt_indent_1 {
+#uovhrulgbm .gt_indent_1 {
   text-indent: 5px;
 }
 
-#vgaplxkmsx .gt_indent_2 {
+#uovhrulgbm .gt_indent_2 {
   text-indent: 10px;
 }
 
-#vgaplxkmsx .gt_indent_3 {
+#uovhrulgbm .gt_indent_3 {
   text-indent: 15px;
 }
 
-#vgaplxkmsx .gt_indent_4 {
+#uovhrulgbm .gt_indent_4 {
   text-indent: 20px;
 }
 
-#vgaplxkmsx .gt_indent_5 {
+#uovhrulgbm .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -11557,27 +11644,27 @@ fig5_gas1_stat3_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -11595,7 +11682,7 @@ fig5a <- fig5_gas1_stat3_result$p
 fig5a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-135-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-136-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -11628,23 +11715,23 @@ We check the results of the statistical tests:
 fig5_gas1_stat3p_result$all_wilcox_table
 ```
 
-<div id="saqcidtzho" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#saqcidtzho table {
+<div id="yfzvknqljn" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#yfzvknqljn table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#saqcidtzho thead, #saqcidtzho tbody, #saqcidtzho tfoot, #saqcidtzho tr, #saqcidtzho td, #saqcidtzho th {
+#yfzvknqljn thead, #yfzvknqljn tbody, #yfzvknqljn tfoot, #yfzvknqljn tr, #yfzvknqljn td, #yfzvknqljn th {
   border-style: none;
 }
 
-#saqcidtzho p {
+#yfzvknqljn p {
   margin: 0;
   padding: 0;
 }
 
-#saqcidtzho .gt_table {
+#yfzvknqljn .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -11670,12 +11757,12 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_caption {
+#yfzvknqljn .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#saqcidtzho .gt_title {
+#yfzvknqljn .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -11687,7 +11774,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#saqcidtzho .gt_subtitle {
+#yfzvknqljn .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -11699,7 +11786,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#saqcidtzho .gt_heading {
+#yfzvknqljn .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -11711,13 +11798,13 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_bottom_border {
+#yfzvknqljn .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_col_headings {
+#yfzvknqljn .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -11732,7 +11819,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_col_heading {
+#yfzvknqljn .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11752,7 +11839,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#saqcidtzho .gt_column_spanner_outer {
+#yfzvknqljn .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11764,15 +11851,15 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#saqcidtzho .gt_column_spanner_outer:first-child {
+#yfzvknqljn .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#saqcidtzho .gt_column_spanner_outer:last-child {
+#yfzvknqljn .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#saqcidtzho .gt_column_spanner {
+#yfzvknqljn .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -11784,11 +11871,11 @@ fig5_gas1_stat3p_result$all_wilcox_table
   width: 100%;
 }
 
-#saqcidtzho .gt_spanner_row {
+#yfzvknqljn .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#saqcidtzho .gt_group_heading {
+#yfzvknqljn .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11814,7 +11901,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   text-align: left;
 }
 
-#saqcidtzho .gt_empty_group_heading {
+#yfzvknqljn .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -11829,15 +11916,15 @@ fig5_gas1_stat3p_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#saqcidtzho .gt_from_md > :first-child {
+#yfzvknqljn .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#saqcidtzho .gt_from_md > :last-child {
+#yfzvknqljn .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#saqcidtzho .gt_row {
+#yfzvknqljn .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11856,7 +11943,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#saqcidtzho .gt_stub {
+#yfzvknqljn .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11869,7 +11956,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#saqcidtzho .gt_stub_row_group {
+#yfzvknqljn .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -11883,15 +11970,15 @@ fig5_gas1_stat3p_result$all_wilcox_table
   vertical-align: top;
 }
 
-#saqcidtzho .gt_row_group_first td {
+#yfzvknqljn .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#saqcidtzho .gt_row_group_first th {
+#yfzvknqljn .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#saqcidtzho .gt_summary_row {
+#yfzvknqljn .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -11901,16 +11988,16 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#saqcidtzho .gt_first_summary_row {
+#yfzvknqljn .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_first_summary_row.thick {
+#yfzvknqljn .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#saqcidtzho .gt_last_summary_row {
+#yfzvknqljn .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11920,7 +12007,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_grand_summary_row {
+#yfzvknqljn .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -11930,7 +12017,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#saqcidtzho .gt_first_grand_summary_row {
+#yfzvknqljn .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11940,7 +12027,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_last_grand_summary_row_top {
+#yfzvknqljn .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -11950,11 +12037,11 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_striped {
+#yfzvknqljn .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#saqcidtzho .gt_table_body {
+#yfzvknqljn .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -11963,7 +12050,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_footnotes {
+#yfzvknqljn .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -11977,7 +12064,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_footnote {
+#yfzvknqljn .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -11986,7 +12073,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#saqcidtzho .gt_sourcenotes {
+#yfzvknqljn .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -12000,7 +12087,7 @@ fig5_gas1_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#saqcidtzho .gt_sourcenote {
+#yfzvknqljn .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -12008,63 +12095,63 @@ fig5_gas1_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#saqcidtzho .gt_left {
+#yfzvknqljn .gt_left {
   text-align: left;
 }
 
-#saqcidtzho .gt_center {
+#yfzvknqljn .gt_center {
   text-align: center;
 }
 
-#saqcidtzho .gt_right {
+#yfzvknqljn .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#saqcidtzho .gt_font_normal {
+#yfzvknqljn .gt_font_normal {
   font-weight: normal;
 }
 
-#saqcidtzho .gt_font_bold {
+#yfzvknqljn .gt_font_bold {
   font-weight: bold;
 }
 
-#saqcidtzho .gt_font_italic {
+#yfzvknqljn .gt_font_italic {
   font-style: italic;
 }
 
-#saqcidtzho .gt_super {
+#yfzvknqljn .gt_super {
   font-size: 65%;
 }
 
-#saqcidtzho .gt_footnote_marks {
+#yfzvknqljn .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#saqcidtzho .gt_asterisk {
+#yfzvknqljn .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#saqcidtzho .gt_indent_1 {
+#yfzvknqljn .gt_indent_1 {
   text-indent: 5px;
 }
 
-#saqcidtzho .gt_indent_2 {
+#yfzvknqljn .gt_indent_2 {
   text-indent: 10px;
 }
 
-#saqcidtzho .gt_indent_3 {
+#yfzvknqljn .gt_indent_3 {
   text-indent: 15px;
 }
 
-#saqcidtzho .gt_indent_4 {
+#yfzvknqljn .gt_indent_4 {
   text-indent: 20px;
 }
 
-#saqcidtzho .gt_indent_5 {
+#yfzvknqljn .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -12078,30 +12165,30 @@ fig5_gas1_stat3p_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">14</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -12118,7 +12205,7 @@ fig5b <- fig5_gas1_stat3p_result$p
 fig5b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-141-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-142-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -12154,23 +12241,23 @@ We check the results of the statistical tests:
 fig5_gas2_gas3_stat3_result$all_wilcox_table
 ```
 
-<div id="wqvwenpprb" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#wqvwenpprb table {
+<div id="mtoqkmteqz" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#mtoqkmteqz table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#wqvwenpprb thead, #wqvwenpprb tbody, #wqvwenpprb tfoot, #wqvwenpprb tr, #wqvwenpprb td, #wqvwenpprb th {
+#mtoqkmteqz thead, #mtoqkmteqz tbody, #mtoqkmteqz tfoot, #mtoqkmteqz tr, #mtoqkmteqz td, #mtoqkmteqz th {
   border-style: none;
 }
 
-#wqvwenpprb p {
+#mtoqkmteqz p {
   margin: 0;
   padding: 0;
 }
 
-#wqvwenpprb .gt_table {
+#mtoqkmteqz .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -12196,12 +12283,12 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_caption {
+#mtoqkmteqz .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#wqvwenpprb .gt_title {
+#mtoqkmteqz .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -12213,7 +12300,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#wqvwenpprb .gt_subtitle {
+#mtoqkmteqz .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -12225,7 +12312,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#wqvwenpprb .gt_heading {
+#mtoqkmteqz .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -12237,13 +12324,13 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_bottom_border {
+#mtoqkmteqz .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_col_headings {
+#mtoqkmteqz .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -12258,7 +12345,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_col_heading {
+#mtoqkmteqz .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12278,7 +12365,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#wqvwenpprb .gt_column_spanner_outer {
+#mtoqkmteqz .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12290,15 +12377,15 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#wqvwenpprb .gt_column_spanner_outer:first-child {
+#mtoqkmteqz .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#wqvwenpprb .gt_column_spanner_outer:last-child {
+#mtoqkmteqz .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#wqvwenpprb .gt_column_spanner {
+#mtoqkmteqz .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -12310,11 +12397,11 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   width: 100%;
 }
 
-#wqvwenpprb .gt_spanner_row {
+#mtoqkmteqz .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#wqvwenpprb .gt_group_heading {
+#mtoqkmteqz .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12340,7 +12427,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   text-align: left;
 }
 
-#wqvwenpprb .gt_empty_group_heading {
+#mtoqkmteqz .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -12355,15 +12442,15 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#wqvwenpprb .gt_from_md > :first-child {
+#mtoqkmteqz .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#wqvwenpprb .gt_from_md > :last-child {
+#mtoqkmteqz .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#wqvwenpprb .gt_row {
+#mtoqkmteqz .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12382,7 +12469,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#wqvwenpprb .gt_stub {
+#mtoqkmteqz .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12395,7 +12482,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#wqvwenpprb .gt_stub_row_group {
+#mtoqkmteqz .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12409,15 +12496,15 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#wqvwenpprb .gt_row_group_first td {
+#mtoqkmteqz .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#wqvwenpprb .gt_row_group_first th {
+#mtoqkmteqz .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#wqvwenpprb .gt_summary_row {
+#mtoqkmteqz .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -12427,16 +12514,16 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#wqvwenpprb .gt_first_summary_row {
+#mtoqkmteqz .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_first_summary_row.thick {
+#mtoqkmteqz .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#wqvwenpprb .gt_last_summary_row {
+#mtoqkmteqz .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12446,7 +12533,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_grand_summary_row {
+#mtoqkmteqz .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -12456,7 +12543,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#wqvwenpprb .gt_first_grand_summary_row {
+#mtoqkmteqz .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12466,7 +12553,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_last_grand_summary_row_top {
+#mtoqkmteqz .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12476,11 +12563,11 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_striped {
+#mtoqkmteqz .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#wqvwenpprb .gt_table_body {
+#mtoqkmteqz .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -12489,7 +12576,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_footnotes {
+#mtoqkmteqz .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -12503,7 +12590,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_footnote {
+#mtoqkmteqz .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -12512,7 +12599,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#wqvwenpprb .gt_sourcenotes {
+#mtoqkmteqz .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -12526,7 +12613,7 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#wqvwenpprb .gt_sourcenote {
+#mtoqkmteqz .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -12534,63 +12621,63 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#wqvwenpprb .gt_left {
+#mtoqkmteqz .gt_left {
   text-align: left;
 }
 
-#wqvwenpprb .gt_center {
+#mtoqkmteqz .gt_center {
   text-align: center;
 }
 
-#wqvwenpprb .gt_right {
+#mtoqkmteqz .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#wqvwenpprb .gt_font_normal {
+#mtoqkmteqz .gt_font_normal {
   font-weight: normal;
 }
 
-#wqvwenpprb .gt_font_bold {
+#mtoqkmteqz .gt_font_bold {
   font-weight: bold;
 }
 
-#wqvwenpprb .gt_font_italic {
+#mtoqkmteqz .gt_font_italic {
   font-style: italic;
 }
 
-#wqvwenpprb .gt_super {
+#mtoqkmteqz .gt_super {
   font-size: 65%;
 }
 
-#wqvwenpprb .gt_footnote_marks {
+#mtoqkmteqz .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#wqvwenpprb .gt_asterisk {
+#mtoqkmteqz .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#wqvwenpprb .gt_indent_1 {
+#mtoqkmteqz .gt_indent_1 {
   text-indent: 5px;
 }
 
-#wqvwenpprb .gt_indent_2 {
+#mtoqkmteqz .gt_indent_2 {
   text-indent: 10px;
 }
 
-#wqvwenpprb .gt_indent_3 {
+#mtoqkmteqz .gt_indent_3 {
   text-indent: 15px;
 }
 
-#wqvwenpprb .gt_indent_4 {
+#mtoqkmteqz .gt_indent_4 {
   text-indent: 20px;
 }
 
-#wqvwenpprb .gt_indent_5 {
+#mtoqkmteqz .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -12606,27 +12693,27 @@ fig5_gas2_gas3_stat3_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">13.5</td>
-<td headers="P_value" class="gt_row gt_right">0.1465</td>
+<td headers="P_value" class="gt_row gt_right">0.14648918</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -12644,7 +12731,7 @@ fig5c <- fig5_gas2_gas3_stat3_result$p
 fig5c
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-147-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-148-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -12677,23 +12764,23 @@ We check the results of the statistical tests:
 fig5_gas2_gas3_stat3p_result$all_wilcox_table
 ```
 
-<div id="xbwvthmdmd" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#xbwvthmdmd table {
+<div id="vnkbtkbduf" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#vnkbtkbduf table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#xbwvthmdmd thead, #xbwvthmdmd tbody, #xbwvthmdmd tfoot, #xbwvthmdmd tr, #xbwvthmdmd td, #xbwvthmdmd th {
+#vnkbtkbduf thead, #vnkbtkbduf tbody, #vnkbtkbduf tfoot, #vnkbtkbduf tr, #vnkbtkbduf td, #vnkbtkbduf th {
   border-style: none;
 }
 
-#xbwvthmdmd p {
+#vnkbtkbduf p {
   margin: 0;
   padding: 0;
 }
 
-#xbwvthmdmd .gt_table {
+#vnkbtkbduf .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -12719,12 +12806,12 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_caption {
+#vnkbtkbduf .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#xbwvthmdmd .gt_title {
+#vnkbtkbduf .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -12736,7 +12823,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#xbwvthmdmd .gt_subtitle {
+#vnkbtkbduf .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -12748,7 +12835,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#xbwvthmdmd .gt_heading {
+#vnkbtkbduf .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -12760,13 +12847,13 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_bottom_border {
+#vnkbtkbduf .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_col_headings {
+#vnkbtkbduf .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -12781,7 +12868,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_col_heading {
+#vnkbtkbduf .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12801,7 +12888,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xbwvthmdmd .gt_column_spanner_outer {
+#vnkbtkbduf .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12813,15 +12900,15 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#xbwvthmdmd .gt_column_spanner_outer:first-child {
+#vnkbtkbduf .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#xbwvthmdmd .gt_column_spanner_outer:last-child {
+#vnkbtkbduf .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#xbwvthmdmd .gt_column_spanner {
+#vnkbtkbduf .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -12833,11 +12920,11 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   width: 100%;
 }
 
-#xbwvthmdmd .gt_spanner_row {
+#vnkbtkbduf .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#xbwvthmdmd .gt_group_heading {
+#vnkbtkbduf .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12863,7 +12950,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   text-align: left;
 }
 
-#xbwvthmdmd .gt_empty_group_heading {
+#vnkbtkbduf .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -12878,15 +12965,15 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#xbwvthmdmd .gt_from_md > :first-child {
+#vnkbtkbduf .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#xbwvthmdmd .gt_from_md > :last-child {
+#vnkbtkbduf .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#xbwvthmdmd .gt_row {
+#vnkbtkbduf .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12905,7 +12992,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xbwvthmdmd .gt_stub {
+#vnkbtkbduf .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12918,7 +13005,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xbwvthmdmd .gt_stub_row_group {
+#vnkbtkbduf .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -12932,15 +13019,15 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   vertical-align: top;
 }
 
-#xbwvthmdmd .gt_row_group_first td {
+#vnkbtkbduf .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#xbwvthmdmd .gt_row_group_first th {
+#vnkbtkbduf .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#xbwvthmdmd .gt_summary_row {
+#vnkbtkbduf .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -12950,16 +13037,16 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xbwvthmdmd .gt_first_summary_row {
+#vnkbtkbduf .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_first_summary_row.thick {
+#vnkbtkbduf .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#xbwvthmdmd .gt_last_summary_row {
+#vnkbtkbduf .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12969,7 +13056,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_grand_summary_row {
+#vnkbtkbduf .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -12979,7 +13066,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xbwvthmdmd .gt_first_grand_summary_row {
+#vnkbtkbduf .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12989,7 +13076,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_last_grand_summary_row_top {
+#vnkbtkbduf .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -12999,11 +13086,11 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_striped {
+#vnkbtkbduf .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#xbwvthmdmd .gt_table_body {
+#vnkbtkbduf .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -13012,7 +13099,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_footnotes {
+#vnkbtkbduf .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -13026,7 +13113,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_footnote {
+#vnkbtkbduf .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -13035,7 +13122,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xbwvthmdmd .gt_sourcenotes {
+#vnkbtkbduf .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -13049,7 +13136,7 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xbwvthmdmd .gt_sourcenote {
+#vnkbtkbduf .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -13057,63 +13144,63 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xbwvthmdmd .gt_left {
+#vnkbtkbduf .gt_left {
   text-align: left;
 }
 
-#xbwvthmdmd .gt_center {
+#vnkbtkbduf .gt_center {
   text-align: center;
 }
 
-#xbwvthmdmd .gt_right {
+#vnkbtkbduf .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#xbwvthmdmd .gt_font_normal {
+#vnkbtkbduf .gt_font_normal {
   font-weight: normal;
 }
 
-#xbwvthmdmd .gt_font_bold {
+#vnkbtkbduf .gt_font_bold {
   font-weight: bold;
 }
 
-#xbwvthmdmd .gt_font_italic {
+#vnkbtkbduf .gt_font_italic {
   font-style: italic;
 }
 
-#xbwvthmdmd .gt_super {
+#vnkbtkbduf .gt_super {
   font-size: 65%;
 }
 
-#xbwvthmdmd .gt_footnote_marks {
+#vnkbtkbduf .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#xbwvthmdmd .gt_asterisk {
+#vnkbtkbduf .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#xbwvthmdmd .gt_indent_1 {
+#vnkbtkbduf .gt_indent_1 {
   text-indent: 5px;
 }
 
-#xbwvthmdmd .gt_indent_2 {
+#vnkbtkbduf .gt_indent_2 {
   text-indent: 10px;
 }
 
-#xbwvthmdmd .gt_indent_3 {
+#vnkbtkbduf .gt_indent_3 {
   text-indent: 15px;
 }
 
-#xbwvthmdmd .gt_indent_4 {
+#vnkbtkbduf .gt_indent_4 {
   text-indent: 20px;
 }
 
-#xbwvthmdmd .gt_indent_5 {
+#vnkbtkbduf .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -13127,29 +13214,29 @@ fig5_gas2_gas3_stat3p_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -13167,7 +13254,7 @@ fig5d <- fig5_gas2_gas3_stat3p_result$p
 fig5d
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-153-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-154-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -13200,23 +13287,23 @@ We check the results of the statistical tests:
 fig5_gas4_stat3_result$all_wilcox_table
 ```
 
-<div id="uhxrwiultu" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#uhxrwiultu table {
+<div id="saqcfhmjmw" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#saqcfhmjmw table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#uhxrwiultu thead, #uhxrwiultu tbody, #uhxrwiultu tfoot, #uhxrwiultu tr, #uhxrwiultu td, #uhxrwiultu th {
+#saqcfhmjmw thead, #saqcfhmjmw tbody, #saqcfhmjmw tfoot, #saqcfhmjmw tr, #saqcfhmjmw td, #saqcfhmjmw th {
   border-style: none;
 }
 
-#uhxrwiultu p {
+#saqcfhmjmw p {
   margin: 0;
   padding: 0;
 }
 
-#uhxrwiultu .gt_table {
+#saqcfhmjmw .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -13242,12 +13329,12 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_caption {
+#saqcfhmjmw .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#uhxrwiultu .gt_title {
+#saqcfhmjmw .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -13259,7 +13346,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#uhxrwiultu .gt_subtitle {
+#saqcfhmjmw .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -13271,7 +13358,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#uhxrwiultu .gt_heading {
+#saqcfhmjmw .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -13283,13 +13370,13 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_bottom_border {
+#saqcfhmjmw .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_col_headings {
+#saqcfhmjmw .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -13304,7 +13391,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_col_heading {
+#saqcfhmjmw .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13324,7 +13411,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#uhxrwiultu .gt_column_spanner_outer {
+#saqcfhmjmw .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13336,15 +13423,15 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#uhxrwiultu .gt_column_spanner_outer:first-child {
+#saqcfhmjmw .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#uhxrwiultu .gt_column_spanner_outer:last-child {
+#saqcfhmjmw .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#uhxrwiultu .gt_column_spanner {
+#saqcfhmjmw .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -13356,11 +13443,11 @@ fig5_gas4_stat3_result$all_wilcox_table
   width: 100%;
 }
 
-#uhxrwiultu .gt_spanner_row {
+#saqcfhmjmw .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#uhxrwiultu .gt_group_heading {
+#saqcfhmjmw .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13386,7 +13473,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   text-align: left;
 }
 
-#uhxrwiultu .gt_empty_group_heading {
+#saqcfhmjmw .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -13401,15 +13488,15 @@ fig5_gas4_stat3_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#uhxrwiultu .gt_from_md > :first-child {
+#saqcfhmjmw .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#uhxrwiultu .gt_from_md > :last-child {
+#saqcfhmjmw .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#uhxrwiultu .gt_row {
+#saqcfhmjmw .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13428,7 +13515,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#uhxrwiultu .gt_stub {
+#saqcfhmjmw .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13441,7 +13528,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#uhxrwiultu .gt_stub_row_group {
+#saqcfhmjmw .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13455,15 +13542,15 @@ fig5_gas4_stat3_result$all_wilcox_table
   vertical-align: top;
 }
 
-#uhxrwiultu .gt_row_group_first td {
+#saqcfhmjmw .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#uhxrwiultu .gt_row_group_first th {
+#saqcfhmjmw .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#uhxrwiultu .gt_summary_row {
+#saqcfhmjmw .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -13473,16 +13560,16 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#uhxrwiultu .gt_first_summary_row {
+#saqcfhmjmw .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_first_summary_row.thick {
+#saqcfhmjmw .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#uhxrwiultu .gt_last_summary_row {
+#saqcfhmjmw .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13492,7 +13579,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_grand_summary_row {
+#saqcfhmjmw .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -13502,7 +13589,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#uhxrwiultu .gt_first_grand_summary_row {
+#saqcfhmjmw .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13512,7 +13599,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_last_grand_summary_row_top {
+#saqcfhmjmw .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13522,11 +13609,11 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_striped {
+#saqcfhmjmw .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#uhxrwiultu .gt_table_body {
+#saqcfhmjmw .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -13535,7 +13622,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_footnotes {
+#saqcfhmjmw .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -13549,7 +13636,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_footnote {
+#saqcfhmjmw .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -13558,7 +13645,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#uhxrwiultu .gt_sourcenotes {
+#saqcfhmjmw .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -13572,7 +13659,7 @@ fig5_gas4_stat3_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#uhxrwiultu .gt_sourcenote {
+#saqcfhmjmw .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -13580,63 +13667,63 @@ fig5_gas4_stat3_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#uhxrwiultu .gt_left {
+#saqcfhmjmw .gt_left {
   text-align: left;
 }
 
-#uhxrwiultu .gt_center {
+#saqcfhmjmw .gt_center {
   text-align: center;
 }
 
-#uhxrwiultu .gt_right {
+#saqcfhmjmw .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#uhxrwiultu .gt_font_normal {
+#saqcfhmjmw .gt_font_normal {
   font-weight: normal;
 }
 
-#uhxrwiultu .gt_font_bold {
+#saqcfhmjmw .gt_font_bold {
   font-weight: bold;
 }
 
-#uhxrwiultu .gt_font_italic {
+#saqcfhmjmw .gt_font_italic {
   font-style: italic;
 }
 
-#uhxrwiultu .gt_super {
+#saqcfhmjmw .gt_super {
   font-size: 65%;
 }
 
-#uhxrwiultu .gt_footnote_marks {
+#saqcfhmjmw .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#uhxrwiultu .gt_asterisk {
+#saqcfhmjmw .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#uhxrwiultu .gt_indent_1 {
+#saqcfhmjmw .gt_indent_1 {
   text-indent: 5px;
 }
 
-#uhxrwiultu .gt_indent_2 {
+#saqcfhmjmw .gt_indent_2 {
   text-indent: 10px;
 }
 
-#uhxrwiultu .gt_indent_3 {
+#saqcfhmjmw .gt_indent_3 {
   text-indent: 15px;
 }
 
-#uhxrwiultu .gt_indent_4 {
+#saqcfhmjmw .gt_indent_4 {
   text-indent: 20px;
 }
 
-#uhxrwiultu .gt_indent_5 {
+#saqcfhmjmw .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -13652,27 +13739,27 @@ fig5_gas4_stat3_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">15</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3 vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -13690,7 +13777,7 @@ fig5e <- fig5_gas4_stat3_result$p
 fig5e
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-159-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-160-1.png)
 
 We export the figure to a PDF file in the Figure5 directory:
 
@@ -13728,23 +13815,23 @@ We check the results of the statistical tests:
 fig5_gas4_stat3p_result$all_wilcox_table
 ```
 
-<div id="ilxmighugn" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#ilxmighugn table {
+<div id="jezuokphkx" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#jezuokphkx table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#ilxmighugn thead, #ilxmighugn tbody, #ilxmighugn tfoot, #ilxmighugn tr, #ilxmighugn td, #ilxmighugn th {
+#jezuokphkx thead, #jezuokphkx tbody, #jezuokphkx tfoot, #jezuokphkx tr, #jezuokphkx td, #jezuokphkx th {
   border-style: none;
 }
 
-#ilxmighugn p {
+#jezuokphkx p {
   margin: 0;
   padding: 0;
 }
 
-#ilxmighugn .gt_table {
+#jezuokphkx .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -13770,12 +13857,12 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_caption {
+#jezuokphkx .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#ilxmighugn .gt_title {
+#jezuokphkx .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -13787,7 +13874,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#ilxmighugn .gt_subtitle {
+#jezuokphkx .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -13799,7 +13886,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#ilxmighugn .gt_heading {
+#jezuokphkx .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -13811,13 +13898,13 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_bottom_border {
+#jezuokphkx .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_col_headings {
+#jezuokphkx .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -13832,7 +13919,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_col_heading {
+#jezuokphkx .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13852,7 +13939,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#ilxmighugn .gt_column_spanner_outer {
+#jezuokphkx .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13864,15 +13951,15 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#ilxmighugn .gt_column_spanner_outer:first-child {
+#jezuokphkx .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#ilxmighugn .gt_column_spanner_outer:last-child {
+#jezuokphkx .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#ilxmighugn .gt_column_spanner {
+#jezuokphkx .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -13884,11 +13971,11 @@ fig5_gas4_stat3p_result$all_wilcox_table
   width: 100%;
 }
 
-#ilxmighugn .gt_spanner_row {
+#jezuokphkx .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#ilxmighugn .gt_group_heading {
+#jezuokphkx .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13914,7 +14001,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   text-align: left;
 }
 
-#ilxmighugn .gt_empty_group_heading {
+#jezuokphkx .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -13929,15 +14016,15 @@ fig5_gas4_stat3p_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#ilxmighugn .gt_from_md > :first-child {
+#jezuokphkx .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#ilxmighugn .gt_from_md > :last-child {
+#jezuokphkx .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#ilxmighugn .gt_row {
+#jezuokphkx .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -13956,7 +14043,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#ilxmighugn .gt_stub {
+#jezuokphkx .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13969,7 +14056,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ilxmighugn .gt_stub_row_group {
+#jezuokphkx .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -13983,15 +14070,15 @@ fig5_gas4_stat3p_result$all_wilcox_table
   vertical-align: top;
 }
 
-#ilxmighugn .gt_row_group_first td {
+#jezuokphkx .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#ilxmighugn .gt_row_group_first th {
+#jezuokphkx .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#ilxmighugn .gt_summary_row {
+#jezuokphkx .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -14001,16 +14088,16 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ilxmighugn .gt_first_summary_row {
+#jezuokphkx .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_first_summary_row.thick {
+#jezuokphkx .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#ilxmighugn .gt_last_summary_row {
+#jezuokphkx .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14020,7 +14107,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_grand_summary_row {
+#jezuokphkx .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -14030,7 +14117,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ilxmighugn .gt_first_grand_summary_row {
+#jezuokphkx .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14040,7 +14127,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_last_grand_summary_row_top {
+#jezuokphkx .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14050,11 +14137,11 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_striped {
+#jezuokphkx .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#ilxmighugn .gt_table_body {
+#jezuokphkx .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -14063,7 +14150,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_footnotes {
+#jezuokphkx .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -14077,7 +14164,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_footnote {
+#jezuokphkx .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -14086,7 +14173,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ilxmighugn .gt_sourcenotes {
+#jezuokphkx .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -14100,7 +14187,7 @@ fig5_gas4_stat3p_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#ilxmighugn .gt_sourcenote {
+#jezuokphkx .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -14108,63 +14195,63 @@ fig5_gas4_stat3p_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#ilxmighugn .gt_left {
+#jezuokphkx .gt_left {
   text-align: left;
 }
 
-#ilxmighugn .gt_center {
+#jezuokphkx .gt_center {
   text-align: center;
 }
 
-#ilxmighugn .gt_right {
+#jezuokphkx .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#ilxmighugn .gt_font_normal {
+#jezuokphkx .gt_font_normal {
   font-weight: normal;
 }
 
-#ilxmighugn .gt_font_bold {
+#jezuokphkx .gt_font_bold {
   font-weight: bold;
 }
 
-#ilxmighugn .gt_font_italic {
+#jezuokphkx .gt_font_italic {
   font-style: italic;
 }
 
-#ilxmighugn .gt_super {
+#jezuokphkx .gt_super {
   font-size: 65%;
 }
 
-#ilxmighugn .gt_footnote_marks {
+#jezuokphkx .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#ilxmighugn .gt_asterisk {
+#jezuokphkx .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#ilxmighugn .gt_indent_1 {
+#jezuokphkx .gt_indent_1 {
   text-indent: 5px;
 }
 
-#ilxmighugn .gt_indent_2 {
+#jezuokphkx .gt_indent_2 {
   text-indent: 10px;
 }
 
-#ilxmighugn .gt_indent_3 {
+#jezuokphkx .gt_indent_3 {
   text-indent: 15px;
 }
 
-#ilxmighugn .gt_indent_4 {
+#jezuokphkx .gt_indent_4 {
   text-indent: 20px;
 }
 
-#ilxmighugn .gt_indent_5 {
+#jezuokphkx .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -14180,28 +14267,28 @@ fig5_gas4_stat3p_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_STAT3P</td>
 <td headers="Statistic" class="gt_row gt_right">4.5</td>
-<td headers="P_value" class="gt_row gt_right">0.3836</td>
+<td headers="P_value" class="gt_row gt_right">0.38363033</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_STAT3P vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_STAT3P</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_STAT3P vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_STAT3P</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -14218,7 +14305,7 @@ fig5f <- fig5_gas4_stat3p_result$p
 fig5f
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-165-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-166-1.png)
 
 We use the `plot_grid` function to create the composite Figure 5. The
 figure will have 2 rows and 5 columns, with the first row containing the
@@ -14238,7 +14325,7 @@ composite_fig5 <- plot_grid(fig5a, fig5c, fig5e, fig5g, fig5i,
 composite_fig5
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-167-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-168-1.png)
 
 We save the composite Figure 5 to a file:
 
@@ -14279,23 +14366,23 @@ We check all the statistical test results:
 suppl1_stat5b_qpcr_result$all_wilcox_table
 ```
 
-<div id="xiwhmswnaz" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#xiwhmswnaz table {
+<div id="vwrqcrvwcu" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#vwrqcrvwcu table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#xiwhmswnaz thead, #xiwhmswnaz tbody, #xiwhmswnaz tfoot, #xiwhmswnaz tr, #xiwhmswnaz td, #xiwhmswnaz th {
+#vwrqcrvwcu thead, #vwrqcrvwcu tbody, #vwrqcrvwcu tfoot, #vwrqcrvwcu tr, #vwrqcrvwcu td, #vwrqcrvwcu th {
   border-style: none;
 }
 
-#xiwhmswnaz p {
+#vwrqcrvwcu p {
   margin: 0;
   padding: 0;
 }
 
-#xiwhmswnaz .gt_table {
+#vwrqcrvwcu .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -14321,12 +14408,12 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_caption {
+#vwrqcrvwcu .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#xiwhmswnaz .gt_title {
+#vwrqcrvwcu .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -14338,7 +14425,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#xiwhmswnaz .gt_subtitle {
+#vwrqcrvwcu .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -14350,7 +14437,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#xiwhmswnaz .gt_heading {
+#vwrqcrvwcu .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -14362,13 +14449,13 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_bottom_border {
+#vwrqcrvwcu .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_col_headings {
+#vwrqcrvwcu .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -14383,7 +14470,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_col_heading {
+#vwrqcrvwcu .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14403,7 +14490,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xiwhmswnaz .gt_column_spanner_outer {
+#vwrqcrvwcu .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14415,15 +14502,15 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#xiwhmswnaz .gt_column_spanner_outer:first-child {
+#vwrqcrvwcu .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#xiwhmswnaz .gt_column_spanner_outer:last-child {
+#vwrqcrvwcu .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#xiwhmswnaz .gt_column_spanner {
+#vwrqcrvwcu .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -14435,11 +14522,11 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#xiwhmswnaz .gt_spanner_row {
+#vwrqcrvwcu .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#xiwhmswnaz .gt_group_heading {
+#vwrqcrvwcu .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14465,7 +14552,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#xiwhmswnaz .gt_empty_group_heading {
+#vwrqcrvwcu .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -14480,15 +14567,15 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#xiwhmswnaz .gt_from_md > :first-child {
+#vwrqcrvwcu .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#xiwhmswnaz .gt_from_md > :last-child {
+#vwrqcrvwcu .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#xiwhmswnaz .gt_row {
+#vwrqcrvwcu .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14507,7 +14594,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#xiwhmswnaz .gt_stub {
+#vwrqcrvwcu .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14520,7 +14607,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xiwhmswnaz .gt_stub_row_group {
+#vwrqcrvwcu .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14534,15 +14621,15 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#xiwhmswnaz .gt_row_group_first td {
+#vwrqcrvwcu .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#xiwhmswnaz .gt_row_group_first th {
+#vwrqcrvwcu .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#xiwhmswnaz .gt_summary_row {
+#vwrqcrvwcu .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -14552,16 +14639,16 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xiwhmswnaz .gt_first_summary_row {
+#vwrqcrvwcu .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_first_summary_row.thick {
+#vwrqcrvwcu .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#xiwhmswnaz .gt_last_summary_row {
+#vwrqcrvwcu .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14571,7 +14658,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_grand_summary_row {
+#vwrqcrvwcu .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -14581,7 +14668,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xiwhmswnaz .gt_first_grand_summary_row {
+#vwrqcrvwcu .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14591,7 +14678,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_last_grand_summary_row_top {
+#vwrqcrvwcu .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14601,11 +14688,11 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_striped {
+#vwrqcrvwcu .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#xiwhmswnaz .gt_table_body {
+#vwrqcrvwcu .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -14614,7 +14701,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_footnotes {
+#vwrqcrvwcu .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -14628,7 +14715,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_footnote {
+#vwrqcrvwcu .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -14637,7 +14724,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xiwhmswnaz .gt_sourcenotes {
+#vwrqcrvwcu .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -14651,7 +14738,7 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#xiwhmswnaz .gt_sourcenote {
+#vwrqcrvwcu .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -14659,63 +14746,63 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#xiwhmswnaz .gt_left {
+#vwrqcrvwcu .gt_left {
   text-align: left;
 }
 
-#xiwhmswnaz .gt_center {
+#vwrqcrvwcu .gt_center {
   text-align: center;
 }
 
-#xiwhmswnaz .gt_right {
+#vwrqcrvwcu .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#xiwhmswnaz .gt_font_normal {
+#vwrqcrvwcu .gt_font_normal {
   font-weight: normal;
 }
 
-#xiwhmswnaz .gt_font_bold {
+#vwrqcrvwcu .gt_font_bold {
   font-weight: bold;
 }
 
-#xiwhmswnaz .gt_font_italic {
+#vwrqcrvwcu .gt_font_italic {
   font-style: italic;
 }
 
-#xiwhmswnaz .gt_super {
+#vwrqcrvwcu .gt_super {
   font-size: 65%;
 }
 
-#xiwhmswnaz .gt_footnote_marks {
+#vwrqcrvwcu .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#xiwhmswnaz .gt_asterisk {
+#vwrqcrvwcu .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#xiwhmswnaz .gt_indent_1 {
+#vwrqcrvwcu .gt_indent_1 {
   text-indent: 5px;
 }
 
-#xiwhmswnaz .gt_indent_2 {
+#vwrqcrvwcu .gt_indent_2 {
   text-indent: 10px;
 }
 
-#xiwhmswnaz .gt_indent_3 {
+#vwrqcrvwcu .gt_indent_3 {
   text-indent: 15px;
 }
 
-#xiwhmswnaz .gt_indent_4 {
+#vwrqcrvwcu .gt_indent_4 {
   text-indent: 20px;
 }
 
-#xiwhmswnaz .gt_indent_5 {
+#vwrqcrvwcu .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -14729,10 +14816,10 @@ suppl1_stat5b_qpcr_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0022</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.002164502</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -14749,7 +14836,7 @@ suppl_fig1a <- suppl1_stat5b_qpcr_result$p
 suppl_fig1a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-173-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-174-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 1 directory:
 
@@ -14781,23 +14868,23 @@ suppl1_stat5b_protein_result <- compare_protein_groups(
 suppl1_stat5b_protein_result$all_wilcox_table
 ```
 
-<div id="grtpwmhntf" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#grtpwmhntf table {
+<div id="pyuqrppqhu" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#pyuqrppqhu table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#grtpwmhntf thead, #grtpwmhntf tbody, #grtpwmhntf tfoot, #grtpwmhntf tr, #grtpwmhntf td, #grtpwmhntf th {
+#pyuqrppqhu thead, #pyuqrppqhu tbody, #pyuqrppqhu tfoot, #pyuqrppqhu tr, #pyuqrppqhu td, #pyuqrppqhu th {
   border-style: none;
 }
 
-#grtpwmhntf p {
+#pyuqrppqhu p {
   margin: 0;
   padding: 0;
 }
 
-#grtpwmhntf .gt_table {
+#pyuqrppqhu .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -14823,12 +14910,12 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_caption {
+#pyuqrppqhu .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#grtpwmhntf .gt_title {
+#pyuqrppqhu .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -14840,7 +14927,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#grtpwmhntf .gt_subtitle {
+#pyuqrppqhu .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -14852,7 +14939,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#grtpwmhntf .gt_heading {
+#pyuqrppqhu .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -14864,13 +14951,13 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_bottom_border {
+#pyuqrppqhu .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_col_headings {
+#pyuqrppqhu .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -14885,7 +14972,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_col_heading {
+#pyuqrppqhu .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14905,7 +14992,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#grtpwmhntf .gt_column_spanner_outer {
+#pyuqrppqhu .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -14917,15 +15004,15 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#grtpwmhntf .gt_column_spanner_outer:first-child {
+#pyuqrppqhu .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#grtpwmhntf .gt_column_spanner_outer:last-child {
+#pyuqrppqhu .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#grtpwmhntf .gt_column_spanner {
+#pyuqrppqhu .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -14937,11 +15024,11 @@ suppl1_stat5b_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#grtpwmhntf .gt_spanner_row {
+#pyuqrppqhu .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#grtpwmhntf .gt_group_heading {
+#pyuqrppqhu .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -14967,7 +15054,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#grtpwmhntf .gt_empty_group_heading {
+#pyuqrppqhu .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -14982,15 +15069,15 @@ suppl1_stat5b_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#grtpwmhntf .gt_from_md > :first-child {
+#pyuqrppqhu .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#grtpwmhntf .gt_from_md > :last-child {
+#pyuqrppqhu .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#grtpwmhntf .gt_row {
+#pyuqrppqhu .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15009,7 +15096,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#grtpwmhntf .gt_stub {
+#pyuqrppqhu .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15022,7 +15109,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#grtpwmhntf .gt_stub_row_group {
+#pyuqrppqhu .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15036,15 +15123,15 @@ suppl1_stat5b_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#grtpwmhntf .gt_row_group_first td {
+#pyuqrppqhu .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#grtpwmhntf .gt_row_group_first th {
+#pyuqrppqhu .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#grtpwmhntf .gt_summary_row {
+#pyuqrppqhu .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -15054,16 +15141,16 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#grtpwmhntf .gt_first_summary_row {
+#pyuqrppqhu .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_first_summary_row.thick {
+#pyuqrppqhu .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#grtpwmhntf .gt_last_summary_row {
+#pyuqrppqhu .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15073,7 +15160,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_grand_summary_row {
+#pyuqrppqhu .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -15083,7 +15170,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#grtpwmhntf .gt_first_grand_summary_row {
+#pyuqrppqhu .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15093,7 +15180,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_last_grand_summary_row_top {
+#pyuqrppqhu .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15103,11 +15190,11 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_striped {
+#pyuqrppqhu .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#grtpwmhntf .gt_table_body {
+#pyuqrppqhu .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -15116,7 +15203,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_footnotes {
+#pyuqrppqhu .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -15130,7 +15217,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_footnote {
+#pyuqrppqhu .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -15139,7 +15226,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#grtpwmhntf .gt_sourcenotes {
+#pyuqrppqhu .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -15153,7 +15240,7 @@ suppl1_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#grtpwmhntf .gt_sourcenote {
+#pyuqrppqhu .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -15161,63 +15248,63 @@ suppl1_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#grtpwmhntf .gt_left {
+#pyuqrppqhu .gt_left {
   text-align: left;
 }
 
-#grtpwmhntf .gt_center {
+#pyuqrppqhu .gt_center {
   text-align: center;
 }
 
-#grtpwmhntf .gt_right {
+#pyuqrppqhu .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#grtpwmhntf .gt_font_normal {
+#pyuqrppqhu .gt_font_normal {
   font-weight: normal;
 }
 
-#grtpwmhntf .gt_font_bold {
+#pyuqrppqhu .gt_font_bold {
   font-weight: bold;
 }
 
-#grtpwmhntf .gt_font_italic {
+#pyuqrppqhu .gt_font_italic {
   font-style: italic;
 }
 
-#grtpwmhntf .gt_super {
+#pyuqrppqhu .gt_super {
   font-size: 65%;
 }
 
-#grtpwmhntf .gt_footnote_marks {
+#pyuqrppqhu .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#grtpwmhntf .gt_asterisk {
+#pyuqrppqhu .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#grtpwmhntf .gt_indent_1 {
+#pyuqrppqhu .gt_indent_1 {
   text-indent: 5px;
 }
 
-#grtpwmhntf .gt_indent_2 {
+#pyuqrppqhu .gt_indent_2 {
   text-indent: 10px;
 }
 
-#grtpwmhntf .gt_indent_3 {
+#pyuqrppqhu .gt_indent_3 {
   text-indent: 15px;
 }
 
-#grtpwmhntf .gt_indent_4 {
+#pyuqrppqhu .gt_indent_4 {
   text-indent: 20px;
 }
 
-#grtpwmhntf .gt_indent_5 {
+#pyuqrppqhu .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -15231,10 +15318,10 @@ suppl1_stat5b_protein_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -15251,7 +15338,7 @@ suppl_fig1b <- suppl1_stat5b_protein_result$p
 suppl_fig1b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-179-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-180-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 1 directory:
 
@@ -15275,7 +15362,7 @@ composite_suppl1 <- plot_grid(suppl_fig1a, suppl_fig1b, suppl_fig1b,
 composite_suppl1
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-182-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-183-1.png)
 
 We save the composite Supplemental Figure 1:
 
@@ -15308,23 +15395,23 @@ suppl2_ets2_qpcr_result <- compare_qpcr_groups(
 suppl2_ets2_qpcr_result$all_wilcox_table
 ```
 
-<div id="bcixnvdytp" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#bcixnvdytp table {
+<div id="othqqdnlmg" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#othqqdnlmg table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#bcixnvdytp thead, #bcixnvdytp tbody, #bcixnvdytp tfoot, #bcixnvdytp tr, #bcixnvdytp td, #bcixnvdytp th {
+#othqqdnlmg thead, #othqqdnlmg tbody, #othqqdnlmg tfoot, #othqqdnlmg tr, #othqqdnlmg td, #othqqdnlmg th {
   border-style: none;
 }
 
-#bcixnvdytp p {
+#othqqdnlmg p {
   margin: 0;
   padding: 0;
 }
 
-#bcixnvdytp .gt_table {
+#othqqdnlmg .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -15350,12 +15437,12 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_caption {
+#othqqdnlmg .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#bcixnvdytp .gt_title {
+#othqqdnlmg .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -15367,7 +15454,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#bcixnvdytp .gt_subtitle {
+#othqqdnlmg .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -15379,7 +15466,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#bcixnvdytp .gt_heading {
+#othqqdnlmg .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -15391,13 +15478,13 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_bottom_border {
+#othqqdnlmg .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_col_headings {
+#othqqdnlmg .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -15412,7 +15499,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_col_heading {
+#othqqdnlmg .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15432,7 +15519,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#bcixnvdytp .gt_column_spanner_outer {
+#othqqdnlmg .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15444,15 +15531,15 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#bcixnvdytp .gt_column_spanner_outer:first-child {
+#othqqdnlmg .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#bcixnvdytp .gt_column_spanner_outer:last-child {
+#othqqdnlmg .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#bcixnvdytp .gt_column_spanner {
+#othqqdnlmg .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -15464,11 +15551,11 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#bcixnvdytp .gt_spanner_row {
+#othqqdnlmg .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#bcixnvdytp .gt_group_heading {
+#othqqdnlmg .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15494,7 +15581,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#bcixnvdytp .gt_empty_group_heading {
+#othqqdnlmg .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -15509,15 +15596,15 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#bcixnvdytp .gt_from_md > :first-child {
+#othqqdnlmg .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#bcixnvdytp .gt_from_md > :last-child {
+#othqqdnlmg .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#bcixnvdytp .gt_row {
+#othqqdnlmg .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15536,7 +15623,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#bcixnvdytp .gt_stub {
+#othqqdnlmg .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15549,7 +15636,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bcixnvdytp .gt_stub_row_group {
+#othqqdnlmg .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -15563,15 +15650,15 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#bcixnvdytp .gt_row_group_first td {
+#othqqdnlmg .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#bcixnvdytp .gt_row_group_first th {
+#othqqdnlmg .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#bcixnvdytp .gt_summary_row {
+#othqqdnlmg .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -15581,16 +15668,16 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bcixnvdytp .gt_first_summary_row {
+#othqqdnlmg .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_first_summary_row.thick {
+#othqqdnlmg .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#bcixnvdytp .gt_last_summary_row {
+#othqqdnlmg .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15600,7 +15687,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_grand_summary_row {
+#othqqdnlmg .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -15610,7 +15697,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bcixnvdytp .gt_first_grand_summary_row {
+#othqqdnlmg .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15620,7 +15707,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_last_grand_summary_row_top {
+#othqqdnlmg .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -15630,11 +15717,11 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_striped {
+#othqqdnlmg .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#bcixnvdytp .gt_table_body {
+#othqqdnlmg .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -15643,7 +15730,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_footnotes {
+#othqqdnlmg .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -15657,7 +15744,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_footnote {
+#othqqdnlmg .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -15666,7 +15753,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bcixnvdytp .gt_sourcenotes {
+#othqqdnlmg .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -15680,7 +15767,7 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#bcixnvdytp .gt_sourcenote {
+#othqqdnlmg .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -15688,63 +15775,63 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#bcixnvdytp .gt_left {
+#othqqdnlmg .gt_left {
   text-align: left;
 }
 
-#bcixnvdytp .gt_center {
+#othqqdnlmg .gt_center {
   text-align: center;
 }
 
-#bcixnvdytp .gt_right {
+#othqqdnlmg .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#bcixnvdytp .gt_font_normal {
+#othqqdnlmg .gt_font_normal {
   font-weight: normal;
 }
 
-#bcixnvdytp .gt_font_bold {
+#othqqdnlmg .gt_font_bold {
   font-weight: bold;
 }
 
-#bcixnvdytp .gt_font_italic {
+#othqqdnlmg .gt_font_italic {
   font-style: italic;
 }
 
-#bcixnvdytp .gt_super {
+#othqqdnlmg .gt_super {
   font-size: 65%;
 }
 
-#bcixnvdytp .gt_footnote_marks {
+#othqqdnlmg .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#bcixnvdytp .gt_asterisk {
+#othqqdnlmg .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#bcixnvdytp .gt_indent_1 {
+#othqqdnlmg .gt_indent_1 {
   text-indent: 5px;
 }
 
-#bcixnvdytp .gt_indent_2 {
+#othqqdnlmg .gt_indent_2 {
   text-indent: 10px;
 }
 
-#bcixnvdytp .gt_indent_3 {
+#othqqdnlmg .gt_indent_3 {
   text-indent: 15px;
 }
 
-#bcixnvdytp .gt_indent_4 {
+#othqqdnlmg .gt_indent_4 {
   text-indent: 20px;
 }
 
-#bcixnvdytp .gt_indent_5 {
+#othqqdnlmg .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -15760,368 +15847,368 @@ suppl2_ets2_qpcr_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">5.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">15.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3094</td>
+<td headers="P_value" class="gt_row gt_right">0.30942406</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">8.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">2.5</td>
-<td headers="P_value" class="gt_row gt_right">0.1465</td>
+<td headers="P_value" class="gt_row gt_right">0.14648918</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">6.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">13.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3094</td>
+<td headers="P_value" class="gt_row gt_right">0.30942406</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">6.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">8.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">6.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">10.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">13.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1913</td>
+<td headers="P_value" class="gt_row gt_right">0.19126699</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">10.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6286</td>
+<td headers="P_value" class="gt_row gt_right">0.62857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">2.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">9.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3094</td>
+<td headers="P_value" class="gt_row gt_right">0.30942406</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">10.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">2.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">2.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2286</td>
+<td headers="P_value" class="gt_row gt_right">0.22857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">11.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1102</td>
+<td headers="P_value" class="gt_row gt_right">0.11021018</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6286</td>
+<td headers="P_value" class="gt_row gt_right">0.62857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">2.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">5.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">9.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8845</td>
+<td headers="P_value" class="gt_row gt_right">0.88454944</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">7.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">5.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3094</td>
+<td headers="P_value" class="gt_row gt_right">0.30942406</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">11.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">2.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">2.5</td>
-<td headers="P_value" class="gt_row gt_right">0.2845</td>
+<td headers="P_value" class="gt_row gt_right">0.28450270</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">7.5</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">8.0</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0.0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">6.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6631</td>
+<td headers="P_value" class="gt_row gt_right">0.66311725</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1913</td>
+<td headers="P_value" class="gt_row gt_right">0.19126699</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1084</td>
+<td headers="P_value" class="gt_row gt_right">0.10840830</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0294</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02940105</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4.0</td>
-<td headers="P_value" class="gt_row gt_right">0.3094</td>
+<td headers="P_value" class="gt_row gt_right">0.30942406</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_100 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">6.0</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">5.0</td>
-<td headers="P_value" class="gt_row gt_right">0.8571</td>
+<td headers="P_value" class="gt_row gt_right">0.85714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">1.5</td>
-<td headers="P_value" class="gt_row gt_right">0.0814</td>
+<td headers="P_value" class="gt_row gt_right">0.08142910</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">14.0</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">3.0</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="P_value" class="gt_row gt_right">0.40000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">10.0</td>
-<td headers="P_value" class="gt_row gt_right">0.2286</td>
+<td headers="P_value" class="gt_row gt_right">0.22857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16.0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">16.0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -16136,7 +16223,7 @@ suppl_fig2a <- suppl2_ets2_qpcr_result$p
 suppl_fig2a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-188-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-189-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 2 directory:
 
@@ -16167,23 +16254,23 @@ suppl2_ets2_protein_result <- compare_protein_groups(suppl2_ets2_protein_data,
 suppl2_ets2_protein_result$all_wilcox_table
 ```
 
-<div id="jnddedfpzr" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#jnddedfpzr table {
+<div id="jwdpieatxj" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#jwdpieatxj table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#jnddedfpzr thead, #jnddedfpzr tbody, #jnddedfpzr tfoot, #jnddedfpzr tr, #jnddedfpzr td, #jnddedfpzr th {
+#jwdpieatxj thead, #jwdpieatxj tbody, #jwdpieatxj tfoot, #jwdpieatxj tr, #jwdpieatxj td, #jwdpieatxj th {
   border-style: none;
 }
 
-#jnddedfpzr p {
+#jwdpieatxj p {
   margin: 0;
   padding: 0;
 }
 
-#jnddedfpzr .gt_table {
+#jwdpieatxj .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -16209,12 +16296,12 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_caption {
+#jwdpieatxj .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#jnddedfpzr .gt_title {
+#jwdpieatxj .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -16226,7 +16313,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#jnddedfpzr .gt_subtitle {
+#jwdpieatxj .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -16238,7 +16325,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#jnddedfpzr .gt_heading {
+#jwdpieatxj .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -16250,13 +16337,13 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_bottom_border {
+#jwdpieatxj .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_col_headings {
+#jwdpieatxj .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -16271,7 +16358,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_col_heading {
+#jwdpieatxj .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -16291,7 +16378,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#jnddedfpzr .gt_column_spanner_outer {
+#jwdpieatxj .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -16303,15 +16390,15 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#jnddedfpzr .gt_column_spanner_outer:first-child {
+#jwdpieatxj .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#jnddedfpzr .gt_column_spanner_outer:last-child {
+#jwdpieatxj .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#jnddedfpzr .gt_column_spanner {
+#jwdpieatxj .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -16323,11 +16410,11 @@ suppl2_ets2_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#jnddedfpzr .gt_spanner_row {
+#jwdpieatxj .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#jnddedfpzr .gt_group_heading {
+#jwdpieatxj .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -16353,7 +16440,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#jnddedfpzr .gt_empty_group_heading {
+#jwdpieatxj .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -16368,15 +16455,15 @@ suppl2_ets2_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#jnddedfpzr .gt_from_md > :first-child {
+#jwdpieatxj .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#jnddedfpzr .gt_from_md > :last-child {
+#jwdpieatxj .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#jnddedfpzr .gt_row {
+#jwdpieatxj .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -16395,7 +16482,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#jnddedfpzr .gt_stub {
+#jwdpieatxj .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -16408,7 +16495,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#jnddedfpzr .gt_stub_row_group {
+#jwdpieatxj .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -16422,15 +16509,15 @@ suppl2_ets2_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#jnddedfpzr .gt_row_group_first td {
+#jwdpieatxj .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#jnddedfpzr .gt_row_group_first th {
+#jwdpieatxj .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#jnddedfpzr .gt_summary_row {
+#jwdpieatxj .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -16440,16 +16527,16 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#jnddedfpzr .gt_first_summary_row {
+#jwdpieatxj .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_first_summary_row.thick {
+#jwdpieatxj .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#jnddedfpzr .gt_last_summary_row {
+#jwdpieatxj .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -16459,7 +16546,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_grand_summary_row {
+#jwdpieatxj .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -16469,7 +16556,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#jnddedfpzr .gt_first_grand_summary_row {
+#jwdpieatxj .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -16479,7 +16566,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_last_grand_summary_row_top {
+#jwdpieatxj .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -16489,11 +16576,11 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_striped {
+#jwdpieatxj .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#jnddedfpzr .gt_table_body {
+#jwdpieatxj .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -16502,7 +16589,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_footnotes {
+#jwdpieatxj .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -16516,7 +16603,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_footnote {
+#jwdpieatxj .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -16525,7 +16612,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#jnddedfpzr .gt_sourcenotes {
+#jwdpieatxj .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -16539,7 +16626,7 @@ suppl2_ets2_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#jnddedfpzr .gt_sourcenote {
+#jwdpieatxj .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -16547,63 +16634,63 @@ suppl2_ets2_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#jnddedfpzr .gt_left {
+#jwdpieatxj .gt_left {
   text-align: left;
 }
 
-#jnddedfpzr .gt_center {
+#jwdpieatxj .gt_center {
   text-align: center;
 }
 
-#jnddedfpzr .gt_right {
+#jwdpieatxj .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#jnddedfpzr .gt_font_normal {
+#jwdpieatxj .gt_font_normal {
   font-weight: normal;
 }
 
-#jnddedfpzr .gt_font_bold {
+#jwdpieatxj .gt_font_bold {
   font-weight: bold;
 }
 
-#jnddedfpzr .gt_font_italic {
+#jwdpieatxj .gt_font_italic {
   font-style: italic;
 }
 
-#jnddedfpzr .gt_super {
+#jwdpieatxj .gt_super {
   font-size: 65%;
 }
 
-#jnddedfpzr .gt_footnote_marks {
+#jwdpieatxj .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#jnddedfpzr .gt_asterisk {
+#jwdpieatxj .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#jnddedfpzr .gt_indent_1 {
+#jwdpieatxj .gt_indent_1 {
   text-indent: 5px;
 }
 
-#jnddedfpzr .gt_indent_2 {
+#jwdpieatxj .gt_indent_2 {
   text-indent: 10px;
 }
 
-#jnddedfpzr .gt_indent_3 {
+#jwdpieatxj .gt_indent_3 {
   text-indent: 15px;
 }
 
-#jnddedfpzr .gt_indent_4 {
+#jwdpieatxj .gt_indent_4 {
   text-indent: 20px;
 }
 
-#jnddedfpzr .gt_indent_5 {
+#jwdpieatxj .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -16619,367 +16706,367 @@ suppl2_ets2_protein_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">15</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">14</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">14</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">11</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">15</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">11</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">14</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">11</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">14</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">13</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">16</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">5</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_250 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_250 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
   </tbody>
   
@@ -16995,7 +17082,7 @@ suppl_fig2b <- suppl2_ets2_protein_result$p
 suppl_fig2b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-194-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-195-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 2 directory:
 
@@ -17027,23 +17114,23 @@ suppl2_stat5b_protein_result <- compare_protein_groups(suppl2_stat5b_protein_dat
 suppl2_stat5b_protein_result$all_wilcox_table
 ```
 
-<div id="tjieicogmc" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#tjieicogmc table {
+<div id="rgowmtjypt" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#rgowmtjypt table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#tjieicogmc thead, #tjieicogmc tbody, #tjieicogmc tfoot, #tjieicogmc tr, #tjieicogmc td, #tjieicogmc th {
+#rgowmtjypt thead, #rgowmtjypt tbody, #rgowmtjypt tfoot, #rgowmtjypt tr, #rgowmtjypt td, #rgowmtjypt th {
   border-style: none;
 }
 
-#tjieicogmc p {
+#rgowmtjypt p {
   margin: 0;
   padding: 0;
 }
 
-#tjieicogmc .gt_table {
+#rgowmtjypt .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -17069,12 +17156,12 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_caption {
+#rgowmtjypt .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#tjieicogmc .gt_title {
+#rgowmtjypt .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -17086,7 +17173,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#tjieicogmc .gt_subtitle {
+#rgowmtjypt .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -17098,7 +17185,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#tjieicogmc .gt_heading {
+#rgowmtjypt .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -17110,13 +17197,13 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_bottom_border {
+#rgowmtjypt .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_col_headings {
+#rgowmtjypt .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -17131,7 +17218,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_col_heading {
+#rgowmtjypt .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -17151,7 +17238,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tjieicogmc .gt_column_spanner_outer {
+#rgowmtjypt .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -17163,15 +17250,15 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#tjieicogmc .gt_column_spanner_outer:first-child {
+#rgowmtjypt .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#tjieicogmc .gt_column_spanner_outer:last-child {
+#rgowmtjypt .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#tjieicogmc .gt_column_spanner {
+#rgowmtjypt .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -17183,11 +17270,11 @@ suppl2_stat5b_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#tjieicogmc .gt_spanner_row {
+#rgowmtjypt .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#tjieicogmc .gt_group_heading {
+#rgowmtjypt .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -17213,7 +17300,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#tjieicogmc .gt_empty_group_heading {
+#rgowmtjypt .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -17228,15 +17315,15 @@ suppl2_stat5b_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#tjieicogmc .gt_from_md > :first-child {
+#rgowmtjypt .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#tjieicogmc .gt_from_md > :last-child {
+#rgowmtjypt .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#tjieicogmc .gt_row {
+#rgowmtjypt .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -17255,7 +17342,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tjieicogmc .gt_stub {
+#rgowmtjypt .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -17268,7 +17355,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjieicogmc .gt_stub_row_group {
+#rgowmtjypt .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -17282,15 +17369,15 @@ suppl2_stat5b_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#tjieicogmc .gt_row_group_first td {
+#rgowmtjypt .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#tjieicogmc .gt_row_group_first th {
+#rgowmtjypt .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#tjieicogmc .gt_summary_row {
+#rgowmtjypt .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -17300,16 +17387,16 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjieicogmc .gt_first_summary_row {
+#rgowmtjypt .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_first_summary_row.thick {
+#rgowmtjypt .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#tjieicogmc .gt_last_summary_row {
+#rgowmtjypt .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -17319,7 +17406,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_grand_summary_row {
+#rgowmtjypt .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -17329,7 +17416,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjieicogmc .gt_first_grand_summary_row {
+#rgowmtjypt .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -17339,7 +17426,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_last_grand_summary_row_top {
+#rgowmtjypt .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -17349,11 +17436,11 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_striped {
+#rgowmtjypt .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#tjieicogmc .gt_table_body {
+#rgowmtjypt .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -17362,7 +17449,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_footnotes {
+#rgowmtjypt .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -17376,7 +17463,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_footnote {
+#rgowmtjypt .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -17385,7 +17472,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjieicogmc .gt_sourcenotes {
+#rgowmtjypt .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -17399,7 +17486,7 @@ suppl2_stat5b_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjieicogmc .gt_sourcenote {
+#rgowmtjypt .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -17407,63 +17494,63 @@ suppl2_stat5b_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjieicogmc .gt_left {
+#rgowmtjypt .gt_left {
   text-align: left;
 }
 
-#tjieicogmc .gt_center {
+#rgowmtjypt .gt_center {
   text-align: center;
 }
 
-#tjieicogmc .gt_right {
+#rgowmtjypt .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#tjieicogmc .gt_font_normal {
+#rgowmtjypt .gt_font_normal {
   font-weight: normal;
 }
 
-#tjieicogmc .gt_font_bold {
+#rgowmtjypt .gt_font_bold {
   font-weight: bold;
 }
 
-#tjieicogmc .gt_font_italic {
+#rgowmtjypt .gt_font_italic {
   font-style: italic;
 }
 
-#tjieicogmc .gt_super {
+#rgowmtjypt .gt_super {
   font-size: 65%;
 }
 
-#tjieicogmc .gt_footnote_marks {
+#rgowmtjypt .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#tjieicogmc .gt_asterisk {
+#rgowmtjypt .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#tjieicogmc .gt_indent_1 {
+#rgowmtjypt .gt_indent_1 {
   text-indent: 5px;
 }
 
-#tjieicogmc .gt_indent_2 {
+#rgowmtjypt .gt_indent_2 {
   text-indent: 10px;
 }
 
-#tjieicogmc .gt_indent_3 {
+#rgowmtjypt .gt_indent_3 {
   text-indent: 15px;
 }
 
-#tjieicogmc .gt_indent_4 {
+#rgowmtjypt .gt_indent_4 {
   text-indent: 20px;
 }
 
-#tjieicogmc .gt_indent_5 {
+#rgowmtjypt .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -17479,368 +17566,368 @@ suppl2_stat5b_protein_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs CM_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_VCT</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs CM_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs CM_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_VCT</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs CM_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_VCT</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs CM_250</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs CM_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs CM_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs CM_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_VCT</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_250</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs CM_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_VCT</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_100 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_500</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">6</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_250 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_250 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1000</td>
 <td headers="Statistic" class="gt_row gt_right">7</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_100</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.6286</td>
+<td headers="P_value" class="gt_row gt_right">0.62857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs CM_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">5</td>
-<td headers="P_value" class="gt_row gt_right">0.4857</td>
+<td headers="P_value" class="gt_row gt_right">0.48571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.6286</td>
+<td headers="P_value" class="gt_row gt_right">0.62857143</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="P_value" class="gt_row gt_right">1.00000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM_1500 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">0.3429</td>
+<td headers="P_value" class="gt_row gt_right">0.34285714</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">10</td>
-<td headers="P_value" class="gt_row gt_right">0.6857</td>
+<td headers="P_value" class="gt_row gt_right">0.68571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
+<td headers="P_value" class="gt_row gt_right">0.20000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">1</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">12</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.8857</td>
+<td headers="P_value" class="gt_row gt_right">0.88571429</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.1143</td>
+<td headers="P_value" class="gt_row gt_right">0.11428571</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.0571</td>
+<td headers="P_value" class="gt_row gt_right">0.05714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -17855,7 +17942,7 @@ suppl_fig2d <- suppl2_stat5b_protein_result$p
 suppl_fig2d
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-200-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-201-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 2 directory:
 
@@ -17869,17 +17956,17 @@ ggsave("output/Supplemental_Figure2/suppl_fig2d_stat5b_protein.pdf", suppl_fig2d
 We do the same for IL2 mRNA expression levels (qPCR):
 
 ``` r
-suppl2_il2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "IL2_mRNA_new_data")
+suppl2_il2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "IL2_mRNA_new_data_20250725")
 ```
 
 ``` r
-suppl2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
+suppl2_il2_qpcr_result <- compare_qpcr_groups_with_only_ratio(
   suppl2_il2_qpcr_data,
   group_col = "treatment",
-  actin_col = "actin",
-  gene_col = "il2",
   ratio_col = "ratio",
-  control_group = "CM"
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("PI", "PI_500"), c("PI", "PI_1000"))
 )
 ```
 
@@ -17887,23 +17974,23 @@ suppl2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
 suppl2_il2_qpcr_result$all_wilcox_table
 ```
 
-<div id="byucsgiccm" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#byucsgiccm table {
+<div id="ruvdannljv" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#ruvdannljv table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#byucsgiccm thead, #byucsgiccm tbody, #byucsgiccm tfoot, #byucsgiccm tr, #byucsgiccm td, #byucsgiccm th {
+#ruvdannljv thead, #ruvdannljv tbody, #ruvdannljv tfoot, #ruvdannljv tr, #ruvdannljv td, #ruvdannljv th {
   border-style: none;
 }
 
-#byucsgiccm p {
+#ruvdannljv p {
   margin: 0;
   padding: 0;
 }
 
-#byucsgiccm .gt_table {
+#ruvdannljv .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -17929,12 +18016,12 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_caption {
+#ruvdannljv .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#byucsgiccm .gt_title {
+#ruvdannljv .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -17946,7 +18033,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#byucsgiccm .gt_subtitle {
+#ruvdannljv .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -17958,7 +18045,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#byucsgiccm .gt_heading {
+#ruvdannljv .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -17970,13 +18057,13 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_bottom_border {
+#ruvdannljv .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_col_headings {
+#ruvdannljv .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -17991,7 +18078,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_col_heading {
+#ruvdannljv .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18011,7 +18098,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#byucsgiccm .gt_column_spanner_outer {
+#ruvdannljv .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18023,15 +18110,15 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#byucsgiccm .gt_column_spanner_outer:first-child {
+#ruvdannljv .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#byucsgiccm .gt_column_spanner_outer:last-child {
+#ruvdannljv .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#byucsgiccm .gt_column_spanner {
+#ruvdannljv .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -18043,11 +18130,11 @@ suppl2_il2_qpcr_result$all_wilcox_table
   width: 100%;
 }
 
-#byucsgiccm .gt_spanner_row {
+#ruvdannljv .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#byucsgiccm .gt_group_heading {
+#ruvdannljv .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18073,7 +18160,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   text-align: left;
 }
 
-#byucsgiccm .gt_empty_group_heading {
+#ruvdannljv .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -18088,15 +18175,15 @@ suppl2_il2_qpcr_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#byucsgiccm .gt_from_md > :first-child {
+#ruvdannljv .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#byucsgiccm .gt_from_md > :last-child {
+#ruvdannljv .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#byucsgiccm .gt_row {
+#ruvdannljv .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18115,7 +18202,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#byucsgiccm .gt_stub {
+#ruvdannljv .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18128,7 +18215,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#byucsgiccm .gt_stub_row_group {
+#ruvdannljv .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18142,15 +18229,15 @@ suppl2_il2_qpcr_result$all_wilcox_table
   vertical-align: top;
 }
 
-#byucsgiccm .gt_row_group_first td {
+#ruvdannljv .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#byucsgiccm .gt_row_group_first th {
+#ruvdannljv .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#byucsgiccm .gt_summary_row {
+#ruvdannljv .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -18160,16 +18247,16 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#byucsgiccm .gt_first_summary_row {
+#ruvdannljv .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_first_summary_row.thick {
+#ruvdannljv .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#byucsgiccm .gt_last_summary_row {
+#ruvdannljv .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18179,7 +18266,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_grand_summary_row {
+#ruvdannljv .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -18189,7 +18276,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#byucsgiccm .gt_first_grand_summary_row {
+#ruvdannljv .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18199,7 +18286,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_last_grand_summary_row_top {
+#ruvdannljv .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18209,11 +18296,11 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_striped {
+#ruvdannljv .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#byucsgiccm .gt_table_body {
+#ruvdannljv .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -18222,7 +18309,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_footnotes {
+#ruvdannljv .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -18236,7 +18323,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_footnote {
+#ruvdannljv .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -18245,7 +18332,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#byucsgiccm .gt_sourcenotes {
+#ruvdannljv .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -18259,7 +18346,7 @@ suppl2_il2_qpcr_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#byucsgiccm .gt_sourcenote {
+#ruvdannljv .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -18267,63 +18354,63 @@ suppl2_il2_qpcr_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#byucsgiccm .gt_left {
+#ruvdannljv .gt_left {
   text-align: left;
 }
 
-#byucsgiccm .gt_center {
+#ruvdannljv .gt_center {
   text-align: center;
 }
 
-#byucsgiccm .gt_right {
+#ruvdannljv .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#byucsgiccm .gt_font_normal {
+#ruvdannljv .gt_font_normal {
   font-weight: normal;
 }
 
-#byucsgiccm .gt_font_bold {
+#ruvdannljv .gt_font_bold {
   font-weight: bold;
 }
 
-#byucsgiccm .gt_font_italic {
+#ruvdannljv .gt_font_italic {
   font-style: italic;
 }
 
-#byucsgiccm .gt_super {
+#ruvdannljv .gt_super {
   font-size: 65%;
 }
 
-#byucsgiccm .gt_footnote_marks {
+#ruvdannljv .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#byucsgiccm .gt_asterisk {
+#ruvdannljv .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#byucsgiccm .gt_indent_1 {
+#ruvdannljv .gt_indent_1 {
   text-indent: 5px;
 }
 
-#byucsgiccm .gt_indent_2 {
+#ruvdannljv .gt_indent_2 {
   text-indent: 10px;
 }
 
-#byucsgiccm .gt_indent_3 {
+#ruvdannljv .gt_indent_3 {
   text-indent: 15px;
 }
 
-#byucsgiccm .gt_indent_4 {
+#ruvdannljv .gt_indent_4 {
   text-indent: 20px;
 }
 
-#byucsgiccm .gt_indent_5 {
+#ruvdannljv .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -18339,116 +18426,116 @@ suppl2_il2_qpcr_result$all_wilcox_table
   <tbody class="gt_table_body">
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_VCT</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_100</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_250</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.035714286</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1000</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.007936508</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">0</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="P_value" class="gt_row gt_right">0.035714286</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_VCT</td>
-<td headers="Statistic" class="gt_row gt_right">3</td>
-<td headers="P_value" class="gt_row gt_right">0.7000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.028571429</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right">4</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="Statistic" class="gt_row gt_right">8</td>
+<td headers="P_value" class="gt_row gt_right">1.000000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.028571429</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">20</td>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_100</td>
-<td headers="Statistic" class="gt_row gt_right">5</td>
-<td headers="P_value" class="gt_row gt_right">1.0000</td>
+<td headers="Statistic" class="gt_row gt_right">10</td>
+<td headers="P_value" class="gt_row gt_right">0.685714286</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.028571429</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">20</td>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_VCT vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_250</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">16</td>
+<td headers="P_value" class="gt_row gt_right">0.028571429</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">20</td>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_100 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_500</td>
-<td headers="Statistic" class="gt_row gt_right">2</td>
-<td headers="P_value" class="gt_row gt_right">0.4000</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">15</td>
+<td headers="P_value" class="gt_row gt_right">0.035714286</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_250 vs PI_1500</td>
 <td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="P_value" class="gt_row gt_right">0.100000000</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1000</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">20</td>
+<td headers="P_value" class="gt_row gt_right">0.015873016</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_500 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right">9</td>
-<td headers="P_value" class="gt_row gt_right">0.1000</td>
+<td headers="Statistic" class="gt_row gt_right">12</td>
+<td headers="P_value" class="gt_row gt_right">0.057142857</td>
 <td headers="Significant" class="gt_row gt_left">No</td></tr>
     <tr><td headers="Comparison" class="gt_row gt_left">PI_1000 vs PI_1500</td>
-<td headers="Statistic" class="gt_row gt_right">8</td>
-<td headers="P_value" class="gt_row gt_right">0.2000</td>
-<td headers="Significant" class="gt_row gt_left">No</td></tr>
+<td headers="Statistic" class="gt_row gt_right">15</td>
+<td headers="P_value" class="gt_row gt_right">0.035714286</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -18463,7 +18550,7 @@ suppl_fig2f <- suppl2_il2_qpcr_result$p
 suppl_fig2f
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-206-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-207-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 2 directory:
 
@@ -18517,23 +18604,23 @@ suppl3_stat3_protein_result <- compare_protein_groups(
 suppl3_stat3_protein_result$all_wilcox_table
 ```
 
-<div id="vkvrvdjvme" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#vkvrvdjvme table {
+<div id="wtvfczipsx" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#wtvfczipsx table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#vkvrvdjvme thead, #vkvrvdjvme tbody, #vkvrvdjvme tfoot, #vkvrvdjvme tr, #vkvrvdjvme td, #vkvrvdjvme th {
+#wtvfczipsx thead, #wtvfczipsx tbody, #wtvfczipsx tfoot, #wtvfczipsx tr, #wtvfczipsx td, #wtvfczipsx th {
   border-style: none;
 }
 
-#vkvrvdjvme p {
+#wtvfczipsx p {
   margin: 0;
   padding: 0;
 }
 
-#vkvrvdjvme .gt_table {
+#wtvfczipsx .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -18559,12 +18646,12 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_caption {
+#wtvfczipsx .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#vkvrvdjvme .gt_title {
+#wtvfczipsx .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -18576,7 +18663,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#vkvrvdjvme .gt_subtitle {
+#wtvfczipsx .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -18588,7 +18675,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#vkvrvdjvme .gt_heading {
+#wtvfczipsx .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -18600,13 +18687,13 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_bottom_border {
+#wtvfczipsx .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_col_headings {
+#wtvfczipsx .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -18621,7 +18708,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_col_heading {
+#wtvfczipsx .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18641,7 +18728,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vkvrvdjvme .gt_column_spanner_outer {
+#wtvfczipsx .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18653,15 +18740,15 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#vkvrvdjvme .gt_column_spanner_outer:first-child {
+#wtvfczipsx .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#vkvrvdjvme .gt_column_spanner_outer:last-child {
+#wtvfczipsx .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#vkvrvdjvme .gt_column_spanner {
+#wtvfczipsx .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -18673,11 +18760,11 @@ suppl3_stat3_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#vkvrvdjvme .gt_spanner_row {
+#wtvfczipsx .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#vkvrvdjvme .gt_group_heading {
+#wtvfczipsx .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18703,7 +18790,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#vkvrvdjvme .gt_empty_group_heading {
+#wtvfczipsx .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -18718,15 +18805,15 @@ suppl3_stat3_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#vkvrvdjvme .gt_from_md > :first-child {
+#wtvfczipsx .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#vkvrvdjvme .gt_from_md > :last-child {
+#wtvfczipsx .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#vkvrvdjvme .gt_row {
+#wtvfczipsx .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18745,7 +18832,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#vkvrvdjvme .gt_stub {
+#wtvfczipsx .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18758,7 +18845,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vkvrvdjvme .gt_stub_row_group {
+#wtvfczipsx .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -18772,15 +18859,15 @@ suppl3_stat3_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#vkvrvdjvme .gt_row_group_first td {
+#wtvfczipsx .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#vkvrvdjvme .gt_row_group_first th {
+#wtvfczipsx .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#vkvrvdjvme .gt_summary_row {
+#wtvfczipsx .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -18790,16 +18877,16 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vkvrvdjvme .gt_first_summary_row {
+#wtvfczipsx .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_first_summary_row.thick {
+#wtvfczipsx .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#vkvrvdjvme .gt_last_summary_row {
+#wtvfczipsx .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18809,7 +18896,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_grand_summary_row {
+#wtvfczipsx .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -18819,7 +18906,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vkvrvdjvme .gt_first_grand_summary_row {
+#wtvfczipsx .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18829,7 +18916,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_last_grand_summary_row_top {
+#wtvfczipsx .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -18839,11 +18926,11 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_striped {
+#wtvfczipsx .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#vkvrvdjvme .gt_table_body {
+#wtvfczipsx .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -18852,7 +18939,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_footnotes {
+#wtvfczipsx .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -18866,7 +18953,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_footnote {
+#wtvfczipsx .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -18875,7 +18962,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vkvrvdjvme .gt_sourcenotes {
+#wtvfczipsx .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -18889,7 +18976,7 @@ suppl3_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#vkvrvdjvme .gt_sourcenote {
+#wtvfczipsx .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -18897,63 +18984,63 @@ suppl3_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#vkvrvdjvme .gt_left {
+#wtvfczipsx .gt_left {
   text-align: left;
 }
 
-#vkvrvdjvme .gt_center {
+#wtvfczipsx .gt_center {
   text-align: center;
 }
 
-#vkvrvdjvme .gt_right {
+#wtvfczipsx .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#vkvrvdjvme .gt_font_normal {
+#wtvfczipsx .gt_font_normal {
   font-weight: normal;
 }
 
-#vkvrvdjvme .gt_font_bold {
+#wtvfczipsx .gt_font_bold {
   font-weight: bold;
 }
 
-#vkvrvdjvme .gt_font_italic {
+#wtvfczipsx .gt_font_italic {
   font-style: italic;
 }
 
-#vkvrvdjvme .gt_super {
+#wtvfczipsx .gt_super {
   font-size: 65%;
 }
 
-#vkvrvdjvme .gt_footnote_marks {
+#wtvfczipsx .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#vkvrvdjvme .gt_asterisk {
+#wtvfczipsx .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#vkvrvdjvme .gt_indent_1 {
+#wtvfczipsx .gt_indent_1 {
   text-indent: 5px;
 }
 
-#vkvrvdjvme .gt_indent_2 {
+#wtvfczipsx .gt_indent_2 {
   text-indent: 10px;
 }
 
-#vkvrvdjvme .gt_indent_3 {
+#wtvfczipsx .gt_indent_3 {
   text-indent: 15px;
 }
 
-#vkvrvdjvme .gt_indent_4 {
+#wtvfczipsx .gt_indent_4 {
   text-indent: 20px;
 }
 
-#vkvrvdjvme .gt_indent_5 {
+#wtvfczipsx .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -18967,10 +19054,10 @@ suppl3_stat3_protein_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -18985,7 +19072,7 @@ suppl_fig3a <- suppl3_stat3_protein_result$p
 suppl_fig3a
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-214-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-215-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 3 directory:
 
@@ -19017,23 +19104,23 @@ suppl3_phospho_stat3_protein_result <- compare_protein_groups(
 suppl3_phospho_stat3_protein_result$all_wilcox_table
 ```
 
-<div id="tjralkuvkc" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
-<style>#tjralkuvkc table {
+<div id="micibjbkoj" style="padding-left:0px;padding-right:0px;padding-top:10px;padding-bottom:10px;overflow-x:auto;overflow-y:auto;width:auto;height:auto;">
+<style>#micibjbkoj table {
   font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#tjralkuvkc thead, #tjralkuvkc tbody, #tjralkuvkc tfoot, #tjralkuvkc tr, #tjralkuvkc td, #tjralkuvkc th {
+#micibjbkoj thead, #micibjbkoj tbody, #micibjbkoj tfoot, #micibjbkoj tr, #micibjbkoj td, #micibjbkoj th {
   border-style: none;
 }
 
-#tjralkuvkc p {
+#micibjbkoj p {
   margin: 0;
   padding: 0;
 }
 
-#tjralkuvkc .gt_table {
+#micibjbkoj .gt_table {
   display: table;
   border-collapse: collapse;
   line-height: normal;
@@ -19059,12 +19146,12 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-left-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_caption {
+#micibjbkoj .gt_caption {
   padding-top: 4px;
   padding-bottom: 4px;
 }
 
-#tjralkuvkc .gt_title {
+#micibjbkoj .gt_title {
   color: #333333;
   font-size: 125%;
   font-weight: initial;
@@ -19076,7 +19163,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-bottom-width: 0;
 }
 
-#tjralkuvkc .gt_subtitle {
+#micibjbkoj .gt_subtitle {
   color: #333333;
   font-size: 85%;
   font-weight: initial;
@@ -19088,7 +19175,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-top-width: 0;
 }
 
-#tjralkuvkc .gt_heading {
+#micibjbkoj .gt_heading {
   background-color: #FFFFFF;
   text-align: center;
   border-bottom-color: #FFFFFF;
@@ -19100,13 +19187,13 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_bottom_border {
+#micibjbkoj .gt_bottom_border {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_col_headings {
+#micibjbkoj .gt_col_headings {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -19121,7 +19208,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_col_heading {
+#micibjbkoj .gt_col_heading {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -19141,7 +19228,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tjralkuvkc .gt_column_spanner_outer {
+#micibjbkoj .gt_column_spanner_outer {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -19153,15 +19240,15 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 4px;
 }
 
-#tjralkuvkc .gt_column_spanner_outer:first-child {
+#micibjbkoj .gt_column_spanner_outer:first-child {
   padding-left: 0;
 }
 
-#tjralkuvkc .gt_column_spanner_outer:last-child {
+#micibjbkoj .gt_column_spanner_outer:last-child {
   padding-right: 0;
 }
 
-#tjralkuvkc .gt_column_spanner {
+#micibjbkoj .gt_column_spanner {
   border-bottom-style: solid;
   border-bottom-width: 2px;
   border-bottom-color: #D3D3D3;
@@ -19173,11 +19260,11 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   width: 100%;
 }
 
-#tjralkuvkc .gt_spanner_row {
+#micibjbkoj .gt_spanner_row {
   border-bottom-style: hidden;
 }
 
-#tjralkuvkc .gt_group_heading {
+#micibjbkoj .gt_group_heading {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -19203,7 +19290,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   text-align: left;
 }
 
-#tjralkuvkc .gt_empty_group_heading {
+#micibjbkoj .gt_empty_group_heading {
   padding: 0.5px;
   color: #333333;
   background-color: #FFFFFF;
@@ -19218,15 +19305,15 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   vertical-align: middle;
 }
 
-#tjralkuvkc .gt_from_md > :first-child {
+#micibjbkoj .gt_from_md > :first-child {
   margin-top: 0;
 }
 
-#tjralkuvkc .gt_from_md > :last-child {
+#micibjbkoj .gt_from_md > :last-child {
   margin-bottom: 0;
 }
 
-#tjralkuvkc .gt_row {
+#micibjbkoj .gt_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -19245,7 +19332,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   overflow-x: hidden;
 }
 
-#tjralkuvkc .gt_stub {
+#micibjbkoj .gt_stub {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -19258,7 +19345,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjralkuvkc .gt_stub_row_group {
+#micibjbkoj .gt_stub_row_group {
   color: #333333;
   background-color: #FFFFFF;
   font-size: 100%;
@@ -19272,15 +19359,15 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   vertical-align: top;
 }
 
-#tjralkuvkc .gt_row_group_first td {
+#micibjbkoj .gt_row_group_first td {
   border-top-width: 2px;
 }
 
-#tjralkuvkc .gt_row_group_first th {
+#micibjbkoj .gt_row_group_first th {
   border-top-width: 2px;
 }
 
-#tjralkuvkc .gt_summary_row {
+#micibjbkoj .gt_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -19290,16 +19377,16 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjralkuvkc .gt_first_summary_row {
+#micibjbkoj .gt_first_summary_row {
   border-top-style: solid;
   border-top-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_first_summary_row.thick {
+#micibjbkoj .gt_first_summary_row.thick {
   border-top-width: 2px;
 }
 
-#tjralkuvkc .gt_last_summary_row {
+#micibjbkoj .gt_last_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -19309,7 +19396,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_grand_summary_row {
+#micibjbkoj .gt_grand_summary_row {
   color: #333333;
   background-color: #FFFFFF;
   text-transform: inherit;
@@ -19319,7 +19406,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjralkuvkc .gt_first_grand_summary_row {
+#micibjbkoj .gt_first_grand_summary_row {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -19329,7 +19416,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-top-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_last_grand_summary_row_top {
+#micibjbkoj .gt_last_grand_summary_row_top {
   padding-top: 8px;
   padding-bottom: 8px;
   padding-left: 5px;
@@ -19339,11 +19426,11 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_striped {
+#micibjbkoj .gt_striped {
   background-color: rgba(128, 128, 128, 0.05);
 }
 
-#tjralkuvkc .gt_table_body {
+#micibjbkoj .gt_table_body {
   border-top-style: solid;
   border-top-width: 2px;
   border-top-color: #D3D3D3;
@@ -19352,7 +19439,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-bottom-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_footnotes {
+#micibjbkoj .gt_footnotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -19366,7 +19453,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_footnote {
+#micibjbkoj .gt_footnote {
   margin: 0px;
   font-size: 90%;
   padding-top: 4px;
@@ -19375,7 +19462,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjralkuvkc .gt_sourcenotes {
+#micibjbkoj .gt_sourcenotes {
   color: #333333;
   background-color: #FFFFFF;
   border-bottom-style: none;
@@ -19389,7 +19476,7 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   border-right-color: #D3D3D3;
 }
 
-#tjralkuvkc .gt_sourcenote {
+#micibjbkoj .gt_sourcenote {
   font-size: 90%;
   padding-top: 4px;
   padding-bottom: 4px;
@@ -19397,63 +19484,63 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
   padding-right: 5px;
 }
 
-#tjralkuvkc .gt_left {
+#micibjbkoj .gt_left {
   text-align: left;
 }
 
-#tjralkuvkc .gt_center {
+#micibjbkoj .gt_center {
   text-align: center;
 }
 
-#tjralkuvkc .gt_right {
+#micibjbkoj .gt_right {
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
 
-#tjralkuvkc .gt_font_normal {
+#micibjbkoj .gt_font_normal {
   font-weight: normal;
 }
 
-#tjralkuvkc .gt_font_bold {
+#micibjbkoj .gt_font_bold {
   font-weight: bold;
 }
 
-#tjralkuvkc .gt_font_italic {
+#micibjbkoj .gt_font_italic {
   font-style: italic;
 }
 
-#tjralkuvkc .gt_super {
+#micibjbkoj .gt_super {
   font-size: 65%;
 }
 
-#tjralkuvkc .gt_footnote_marks {
+#micibjbkoj .gt_footnote_marks {
   font-size: 75%;
   vertical-align: 0.4em;
   position: initial;
 }
 
-#tjralkuvkc .gt_asterisk {
+#micibjbkoj .gt_asterisk {
   font-size: 100%;
   vertical-align: 0;
 }
 
-#tjralkuvkc .gt_indent_1 {
+#micibjbkoj .gt_indent_1 {
   text-indent: 5px;
 }
 
-#tjralkuvkc .gt_indent_2 {
+#micibjbkoj .gt_indent_2 {
   text-indent: 10px;
 }
 
-#tjralkuvkc .gt_indent_3 {
+#micibjbkoj .gt_indent_3 {
   text-indent: 15px;
 }
 
-#tjralkuvkc .gt_indent_4 {
+#micibjbkoj .gt_indent_4 {
   text-indent: 20px;
 }
 
-#tjralkuvkc .gt_indent_5 {
+#micibjbkoj .gt_indent_5 {
   text-indent: 25px;
 }
 </style>
@@ -19467,10 +19554,10 @@ suppl3_phospho_stat3_protein_result$all_wilcox_table
     </tr>
   </thead>
   <tbody class="gt_table_body">
-    <tr><td headers="Comparison" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">CM vs PI</td>
-<td headers="Statistic" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0</td>
-<td headers="P_value" class="gt_row gt_right" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">0.0286</td>
-<td headers="Significant" class="gt_row gt_left" style="background-color: rgba(204,230,255,0.8); color: #000000; font-weight: bold;">Yes</td></tr>
+    <tr><td headers="Comparison" class="gt_row gt_left">CM vs PI</td>
+<td headers="Statistic" class="gt_row gt_right">0</td>
+<td headers="P_value" class="gt_row gt_right">0.02857143</td>
+<td headers="Significant" class="gt_row gt_left">Yes</td></tr>
   </tbody>
   
   
@@ -19485,7 +19572,7 @@ suppl_fig3b <- suppl3_phospho_stat3_protein_result$p
 suppl_fig3b
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-220-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-221-1.png)
 
 We save the figure to a PDF file in the Supplemental Figure 3 directory:
 
@@ -19509,7 +19596,7 @@ composite_suppl3 <- plot_grid(suppl_fig3a, suppl_fig3b, suppl_fig3b,
 composite_suppl3
 ```
 
-![](Data_analysis_files/figure-commonmark/unnamed-chunk-223-1.png)
+![](Data_analysis_files/figure-commonmark/unnamed-chunk-224-1.png)
 
 We save the composite Supplemental Figure 3:
 

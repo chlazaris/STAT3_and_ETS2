@@ -114,13 +114,7 @@ compare_qpcr_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt()
   
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -251,13 +245,7 @@ compare_qpcr_groups_with_ratio <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt()
 
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -291,7 +279,132 @@ compare_qpcr_groups_with_ratio <- function(df, group_col = "treatment",
 }
 ```
 
-We create another function to calculate changes in gene expression levels based only on the ratio:
+
+```{r}
+compare_qpcr_groups_with_only_ratio <- function(df, group_col = "treatment", 
+                                ratio_col = "ratio",
+                                control_group = "CM", 
+                                wilcox_pairs = NULL) {
+  
+  # Define a function to identify outliers and remove them
+  remove_outliers <- function(data, column, group) {
+    data %>%
+    group_by(!!rlang::sym(group)) %>%
+    mutate(
+      Q1 = quantile(!!rlang::sym(column), 0.25, na.rm = TRUE),
+      Q3 = quantile(!!rlang::sym(column), 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      Lower = Q1 - 1.5 * IQR,
+      Upper = Q3 + 1.5 * IQR
+    ) %>%
+    filter(!!rlang::sym(column) >= Lower & !!rlang::sym(column) <= Upper) %>%
+    ungroup() %>%
+    select(-Q1, -Q3, -IQR, -Lower, -Upper)  # Remove helper columns
+   }
+
+  # Remove the outliers from ratio column
+  df <- remove_outliers(data = df, column = ratio_col, group = group_col)
+  
+  # Calculate the FoldChange based on the ratio column
+  df <- df %>%
+    mutate(FoldChange = .data[[ratio_col]])
+  
+  # Normalize so control mean = 1
+  norm_factor <- 1 / mean(df$FoldChange[df[[group_col]] == control_group], na.rm = TRUE)
+
+  # Get the df with the normalized values
+  df <- df %>%
+    mutate(norm_factor = norm_factor,
+      NormFoldChange = FoldChange * norm_factor
+    )
+
+  # Calculate summary statistics by treatment group
+  df <- df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      Mean_NormFoldChange = mean(NormFoldChange, na.rm = TRUE),
+      SEM_NormFoldChange = sd(NormFoldChange, na.rm = TRUE) / sqrt(n())
+    ) 
+  
+  # Mann-Whitney tests for specified pairs (only if wilcox_pairs is provided)
+  wilcox_results <- NULL
+  if (!is.null(wilcox_pairs)) {
+    wilcox_results <- map_dfr(
+      wilcox_pairs,
+      function(pair) {
+        group1 <- pair[1]
+        group2 <- pair[2]
+        vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+        vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+        test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+        tibble(
+          group1 = group1,
+          group2 = group2,
+          p.value = test$p.value,
+          statistic = test$statistic
+        )
+      }
+    )
+  }
+  
+  # Perform all pairwise Mann-Whitney tests
+  group_levels <- unique(as.character(df[[group_col]]))
+  all_pairs <- combn(group_levels, 2, simplify = FALSE)
+  all_wilcox <- map_dfr(
+    all_pairs,
+    function(pair) {
+      group1 <- pair[1]
+      group2 <- pair[2]
+      vals1 <- df$NormFoldChange[df[[group_col]] == group1]
+      vals2 <- df$NormFoldChange[df[[group_col]] == group2]
+      test <- wilcox.test(vals1, vals2, alternative = "two.sided", paired = FALSE)
+      tibble(
+        Comparison = paste(group1, "vs", group2),
+        Statistic = test$statistic,
+        P_value = test$p.value,
+        Significant = ifelse(test$p.value < 0.05, "Yes", "No")
+      )
+    }
+  )
+  
+  # Table with all pairwise comparisons
+  wilcox_table <- all_wilcox %>%
+    gt() 
+
+  # Convert condition to a factor()
+  df$condition <- factor(df$condition, levels = c('CM', 'PI'))
+  
+  # Set group_col (treatment) as a factor with all levels present in the data
+  df[[group_col]] <- factor(df[[group_col]], levels = unique(df[[group_col]]))
+  
+  # Plot
+  p <- ggplot(df, aes(x = !!rlang::sym(group_col), y = NormFoldChange, color = condition, fill = condition)) +
+  stat_summary(fun = mean, geom = "bar", color = "black", alpha = 0.5, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black", alpha = 0.5) +
+  geom_jitter(width = 0.15, color = "black", size = 1) +
+  scale_fill_manual(values = c("gray", "black")) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "IL2",
+    x = group_col,
+    y = "Relative Gene Expression\n(mRNA)"
+  ) +
+  stat_compare_means(
+    comparisons = wilcox_pairs,
+    method = "wilcox.test",
+    hide.ns = TRUE,
+    label = "p.signif",
+    size = 3
+  )
+  
+  # Return the results
+  return(list(df = df, p = p, wilcox_results = wilcox_results, all_wilcox_table = wilcox_table))
+}
+```
+
+
+We create another function to calculate changes in gene expression levels (protein) based only on the ratio:
 
 ```{r}
 compare_protein_ratio <- function(df, 
@@ -363,13 +476,7 @@ compare_protein_ratio <- function(df,
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
 
   # Convert condition to a factor() - assuming condition column exists
   if("condition" %in% names(df)) {
@@ -485,13 +592,7 @@ compare_qpcr_ratio <- function(df,
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
   
   # Convert condition to a factor() - assuming condition column exists
   if("condition" %in% names(df)) {
@@ -620,13 +721,7 @@ compare_protein_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
 
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -757,13 +852,7 @@ compare_chipseq_groups <- function(df, group_col = "treatment",
   
   # Table with all pairwise comparisons
   wilcox_table <- all_wilcox %>%
-    gt() %>%
-    gt_highlight_rows(rows = Significant == "Yes", fill = "#cce6ff") %>%
-    fmt_number(columns = c(P_value), decimals = 4) %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = Significant == "Yes")
-    )
+    gt() 
   
   # Convert condition to a factor()
   df$condition <- factor(df$condition, levels = c('CM', 'PI'))
@@ -2133,18 +2222,18 @@ ggsave("output/Supplemental_Figure2/suppl_fig2d_stat5b_protein.pdf", suppl_fig2d
 We do the same for IL2 mRNA expression levels (qPCR):
 
 ```{r}
-suppl2_il2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "IL2_mRNA_new_data")
+suppl2_il2_qpcr_data <- read_xlsx("input/Supplemental_Figure2_data.xlsx", sheet = "IL2_mRNA_new_data_20250725")
 ```
 
 ```{r}
 #| warning: false
-suppl2_il2_qpcr_result <- compare_qpcr_groups_with_ratio(
+suppl2_il2_qpcr_result <- compare_qpcr_groups_with_only_ratio(
   suppl2_il2_qpcr_data,
   group_col = "treatment",
-  actin_col = "actin",
-  gene_col = "il2",
   ratio_col = "ratio",
-  control_group = "CM"
+  control_group = "CM",
+  wilcox_pairs = list(c("CM", "PI"),
+                      c("PI", "PI_500"), c("PI", "PI_1000"))
 )
 ```
 
